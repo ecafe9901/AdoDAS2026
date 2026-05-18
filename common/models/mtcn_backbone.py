@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..data.text_features import CharTextEncoder
+
 @dataclass
 class BackboneConfig:
     audio_group_dims: dict[str, int] = field(default_factory=dict)
@@ -23,6 +25,8 @@ class BackboneConfig:
 
     n_sessions: int = 4
     d_session: int = 16
+    d_text: int = 0
+    text_vocab: dict | None = None
     d_shared: int = 256
 
 class GroupAdapter(nn.Module):
@@ -178,9 +182,15 @@ class MTCNBackbone(nn.Module):
         self.audio_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
         self.video_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
 
-        fusion_in = 2 * cfg.d_model * 2  
+        self.text_encoder = None
+        if cfg.d_text > 0 and cfg.text_vocab is not None:
+            self.text_encoder = CharTextEncoder(
+                cfg.text_vocab, char_dim=cfg.d_text, text_dim=cfg.d_text)
+
+        fusion_in = 2 * cfg.d_model * 2
         fusion_in += len(self.audio_pooled_group_names) * cfg.d_adapter
-        fusion_in += cfg.d_session 
+        fusion_in += cfg.d_session
+        fusion_in += cfg.d_text 
 
         self.session_embed = nn.Embedding(cfg.n_sessions, cfg.d_session)
 
@@ -234,6 +244,8 @@ class MTCNBackbone(nn.Module):
             for name in self.audio_pooled_group_names
         )
         parts.append(self.session_embed(batch["session_idx"]))
+        if self.text_encoder is not None and batch.get("text_char_ids") is not None:
+            parts.append(self.text_encoder(batch["text_char_ids"]))
 
         z = torch.cat(parts, dim=-1)
         return self.fusion_mlp(z)

@@ -48,6 +48,9 @@ use_pos_weight: true
 patience: 8
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
+use_text_features: true
+use_llm_features: true
+llm_feature_dir: /mnt/data/datasets/AdoDAS/output/llm_features
 submission_level: participant
 decode_method: auto
 label_smoothing: 0.05

@@ -44,6 +44,11 @@ class FeatureConfig:
     mask_policy: str = "and_core"
     core_audio: list[str] = field(default_factory=lambda: ["mel_mfcc", "vad"])
     core_video: list[str] = field(default_factory=lambda: ["face_behavior", "headpose_geom"])
+    use_text_features: bool = False
+    text_model_name: str = "hfl/chinese-roberta-wwm-ext"
+    use_llm_features: bool = False
+    llm_feature_dir: str = ""
+    llm_feature_dim: int = 34  # 21 DASS + 13 markers
 
     @property
     def audio_sequence_features(self) -> list[str]:

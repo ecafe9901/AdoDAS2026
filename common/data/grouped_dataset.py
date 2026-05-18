@@ -59,6 +59,8 @@ class GroupedParticipantDataset(Dataset):
 
         self._feature_dims: dict[str, int] | None = None
         self._cache: list[dict | None] | None = None
+        self._text_cache: dict[str, list[int]] = {}  # cache_key -> char_ids
+        self._char_vocab: dict[str, int] | None = None
 
     @property
     def feature_dims(self) -> dict[str, int]:
@@ -207,9 +209,16 @@ class GroupedParticipantDataset(Dataset):
                 if name not in video_groups and name in dims:
                     video_groups[name] = torch.zeros(T, dims[name])
 
+            # Text char IDs (transcript)
+            if cfg.use_text_features:
+                char_ids = self._load_text_embedding(
+                    str(row["anon_school"]), str(row["anon_class"]),
+                    str(row["anon_pid"]), str(row["session"]),
+                )
+
             session_idx = SESSION_TO_IDX.get(str(row["session"]), 0)
 
-            return {
+            result = {
                 "audio_groups": audio_groups,
                 "audio_pooled_groups": audio_pooled_groups,
                 "video_groups": video_groups,
@@ -222,9 +231,59 @@ class GroupedParticipantDataset(Dataset):
                 "seq_len": T,
                 "session": str(row["session"]),
             }
+            if cfg.use_text_features:
+                result["text_char_ids"] = char_ids
+            return result
         except Exception as e:
             log.debug(f"Failed to load session {row.get('session', '?')} for {row.get('anon_pid', '?')}: {e}")
             return None
+
+    def _load_text_embedding(self, school: str, cls: str, pid: str,
+                              session: str) -> list[int]:
+        """Load cached char IDs (must be pre-encoded by pre_encode_texts)."""
+        cache_key = "__A01__" if session == "A01" else f"{pid}_{session}"
+        if cache_key in self._text_cache:
+            return self._text_cache[cache_key]
+        return [0]  # PAD only
+
+    def pre_encode_texts(self) -> int:
+        """Build char vocab and pre-compute char IDs for all transcripts."""
+        if not self.cfg.use_text_features:
+            return 0
+        from .text_features import load_transcript, _build_char_vocab, _char_ids
+
+        all_texts = []
+        keys = []
+        for info in self.participants:
+            pid = info["anon_pid"]
+            school = info["anon_school"]
+            cls = info["anon_class"]
+            for sess in ["A01", "B01", "B02", "B03"]:
+                cache_key = f"{pid}_{sess}"
+                if cache_key in self._text_cache:
+                    continue
+                text = load_transcript(self.root, self.split, school, cls, pid, sess)
+                if text:
+                    all_texts.append(text)
+                    keys.append(cache_key)
+                else:
+                    self._text_cache[cache_key] = [0]  # mark empty with PAD id
+
+        if not all_texts:
+            return 0
+
+        self._char_vocab = _build_char_vocab(all_texts, min_freq=2)
+        for text, key in zip(all_texts, keys):
+            self._text_cache[key] = _char_ids(text, self._char_vocab)
+
+        # Also cache under __A01__ for shared A01 text
+        for key in list(self._text_cache.keys()):
+            if key.endswith("_A01"):
+                self._text_cache["__A01__"] = self._text_cache[key]
+                break
+
+        log.info(f"Char vocab: {len(self._char_vocab)}, encoded {len(all_texts)} transcripts")
+        return len(all_texts)
 
     def __len__(self) -> int:
         return len(self.participants)
@@ -257,7 +316,18 @@ class GroupedParticipantDataset(Dataset):
                 sessions_data.append(None)
                 session_valid.append(False)
 
-        return {
+        # LLM features (per-participant, loaded from .npy)
+        llm_features = None
+        if self.cfg.use_llm_features and self.cfg.llm_feature_dir:
+            llm_dir = Path(self.cfg.llm_feature_dir) / self.split
+            llm_path = llm_dir / f"{info['anon_school']}_{info['anon_class']}_{info['anon_pid']}.npy"
+            if llm_path.exists():
+                try:
+                    llm_features = torch.from_numpy(np.load(llm_path))
+                except Exception:
+                    pass
+
+        result = {
             "sessions": sessions_data,
             "session_valid": np.array(session_valid, dtype=bool),
             "y_a1": torch.from_numpy(info["y_a1"]),
@@ -267,6 +337,9 @@ class GroupedParticipantDataset(Dataset):
             "anon_class": info["anon_class"],
             "session_names": SESSIONS,
         }
+        if llm_features is not None:
+            result["llm_features"] = llm_features
+        return result
 
     def _apply_session_dropout(self, sample: dict[str, Any]) -> dict[str, Any]:
         valid_indices = [
@@ -480,6 +553,14 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     for i, s in enumerate(all_sessions):
         pad_mask[i, :s["seq_len"]] = False
 
+    # Text char IDs (list of lists, encoded by CharTextEncoder in backbone)
+    text_char_ids = None
+    has_text = any("text_char_ids" in s for s in all_sessions)
+    if has_text:
+        text_char_ids = [
+            s.get("text_char_ids", [0]) for s in all_sessions
+        ]
+
     flat_batch = {
         "audio_groups": _pad_groups(audio_names, "audio_groups"),
         "audio_pooled_groups": {
@@ -503,7 +584,19 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "seq_len": torch.tensor([s["seq_len"] for s in all_sessions], dtype=torch.long),
         "anon_pid": flat_pids,
         "session": flat_sess_names,
+        "text_char_ids": text_char_ids,
     }
+
+    # LLM features (per-participant pooled features)
+    llm_features_list = [b.get("llm_features") for b in batch]
+    llm_features = None
+    if any(f is not None for f in llm_features_list):
+        # Fill missing with zeros
+        dim = next(f.shape[0] for f in llm_features_list if f is not None)
+        llm_features = torch.stack([
+            f if f is not None else torch.zeros(dim)
+            for f in llm_features_list
+        ])
 
     return {
         "flat_batch": flat_batch,
@@ -517,6 +610,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "anon_classes": [b["anon_class"] for b in batch],
         "flat_sessions": flat_sess_names,
         "flat_pids": flat_pids,
+        "llm_features": llm_features,
     }
 
 
@@ -525,7 +619,7 @@ def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
     T = 1  # minimal length
     audio_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["audio_groups"].items()}
     video_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["video_groups"].items()}
-    return {
+    dummy = {
         "audio_groups": audio_groups,
         "audio_pooled_groups": {
             k: torch.zeros_like(v) for k, v in ref["audio_pooled_groups"].items()
@@ -542,3 +636,6 @@ def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
         "seq_len": T,
         "session": "A01",
     }
+    if "text_char_ids" in ref:
+        dummy["text_char_ids"] = [0]  # PAD id
+    return dummy

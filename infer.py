@@ -99,9 +99,14 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", defaults.mask_policy),
         core_audio=cfg.get("core_audio", defaults.core_audio),
         core_video=cfg.get("core_video", defaults.core_video),
+        use_text_features=cfg.get("use_text_features", defaults.use_text_features),
+        use_llm_features=cfg.get("use_llm_features", defaults.use_llm_features),
+        llm_feature_dir=cfg.get("llm_feature_dir", defaults.llm_feature_dir),
     )
 
     ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=args.split)
+    if feat_cfg.use_text_features:
+        ds.pre_encode_texts()
     preload = bool(cfg.get("preload", True))
     num_workers = int(cfg.get("num_workers", 8))
     if preload:
@@ -119,6 +124,12 @@ def main() -> None:
     )
 
     dims = ds.feature_dims
+    d_text = 0
+    text_vocab = None
+    if feat_cfg.use_text_features:
+        d_text = 128
+        text_vocab = ds._char_vocab
+    d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
     bb_cfg = BackboneConfig(
         audio_group_dims={n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims},
         audio_pooled_group_dims={n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims},
@@ -130,6 +141,8 @@ def main() -> None:
         asp_alpha=cfg.get("asp_alpha", 0.5),
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
+        d_text=d_text,
+        text_vocab=text_vocab,
         d_shared=cfg.get("d_shared", 256),
     )
     grouped_model = GroupedModel(
@@ -137,15 +150,17 @@ def main() -> None:
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        d_llm=d_llm,
     ).to(device)
 
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
     if args.task == "a1":
-        task_head = A1Head(bb_cfg.d_shared).to(device)
+        task_head = A1Head(head_in_dim).to(device)
     else:
         if bool(cfg.get("use_coral", False)):
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
+            task_head = CORALHead(head_in_dim).to(device)
         else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            task_head = A2OrdinalHead(head_in_dim).to(device)
 
     state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])

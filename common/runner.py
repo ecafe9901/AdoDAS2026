@@ -364,7 +364,8 @@ def train_one_epoch_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid,
+                             llm_features=batch.get("llm_features"))
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
@@ -456,7 +457,8 @@ def validate_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid,
+                             llm_features=batch.get("llm_features"))
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
@@ -615,7 +617,8 @@ def generate_submission_grouped(
         B = batch["n_participants"]
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid,
+                             llm_features=batch.get("llm_features"))
 
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
@@ -658,7 +661,8 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid,
+                             llm_features=batch.get("llm_features"))
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
@@ -685,7 +689,8 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            out = grouped_model(flat_batch, B, session_valid,
+                             llm_features=batch.get("llm_features"))
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
@@ -792,6 +797,9 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", _defaults.mask_policy),
         core_audio=cfg.get("core_audio", _defaults.core_audio),
         core_video=cfg.get("core_video", _defaults.core_video),
+        use_text_features=cfg.get("use_text_features", _defaults.use_text_features),
+        use_llm_features=cfg.get("use_llm_features", _defaults.use_llm_features),
+        llm_feature_dir=cfg.get("llm_feature_dir", _defaults.llm_feature_dir),
     )
     log.info(f"Mask policy: {feat_cfg.mask_policy}")
 
@@ -804,6 +812,12 @@ def main() -> None:
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
     log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
+
+    if feat_cfg.use_text_features:
+        log.info("Pre-encoding transcript embeddings ...")
+        n_train = train_ds.pre_encode_texts()
+        n_val = val_ds.pre_encode_texts()
+        log.info(f"Text embeddings encoded: {n_train} train + {n_val} val")
 
     preload = bool(cfg.get("preload", True))
     if preload:
@@ -842,6 +856,14 @@ def main() -> None:
     audio_pooled_group_dims = {n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims}
     video_group_dims = {n: dims[n] for n in feat_cfg.video_features if n in dims}
 
+    d_text = 0
+    text_vocab = None
+    if feat_cfg.use_text_features:
+        d_text = 128
+        text_vocab = train_ds._char_vocab
+
+    d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
+
     bb_cfg = BackboneConfig(
         audio_group_dims=audio_group_dims,
         audio_pooled_group_dims=audio_pooled_group_dims,
@@ -853,6 +875,8 @@ def main() -> None:
         asp_alpha=cfg.get("asp_alpha", 0.5),
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
+        d_text=d_text,
+        text_vocab=text_vocab,
         d_shared=cfg.get("d_shared", 256),
     )
 
@@ -862,18 +886,21 @@ def main() -> None:
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        d_llm=d_llm,
     ).to(device)
+
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
 
     use_coral = bool(cfg.get("use_coral", False))
     if task == "a1":
         bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
+        task_head = A1Head(head_in_dim, bias_init=bias_init).to(device)
     else:
         if use_coral:
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
+            task_head = CORALHead(head_in_dim).to(device)
             log.info("Using CORAL head for A2")
         else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            task_head = A2OrdinalHead(head_in_dim).to(device)
 
     n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
     log.info(f"Model params: {n_params:,}")
