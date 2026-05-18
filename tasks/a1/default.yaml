@@ -1,6 +1,6 @@
-feature_root: /media/k3nwong/Data1/test/outputs/pipeline/anonymized
-manifest_dir: /media/k3nwong/Data1/test/outputs/data
-output_dir: /media/k3nwong/Data1/test/adodas_baseline/output/a1
+feature_root: /mnt/data/datasets/AdoDAS/Train
+manifest_dir: /mnt/data/datasets/AdoDAS/manifests
+output_dir: /mnt/data/datasets/AdoDAS/output/a1
 
 feature_selection:
   audio_features:
@@ -41,7 +41,7 @@ epochs: 30
 seed: 42
 num_workers: 8
 amp: true
-preload: true
+preload: false
 grad_clip: 1.0
 use_pos_weight: true
 patience: 6

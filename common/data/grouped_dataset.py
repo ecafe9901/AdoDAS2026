@@ -331,6 +331,84 @@ class GroupedParticipantDataset(Dataset):
         return self._cache is not None
 
 
+def build_length_bucketed_batches(
+    dataset: GroupedParticipantDataset,
+    batch_size: int,
+    num_buckets: int = 10,
+    seed: int = 42,
+) -> list[list[int]]:
+    """Build batches where participants have similar max session lengths.
+
+    Dynamically adjusts batch size per bucket: short-session buckets use
+    larger batches, long-session buckets use smaller batches. Targets
+    the same memory footprint per batch.
+    """
+    import random as _random
+    import math
+    rng = _random.Random(seed)
+
+    n = len(dataset)
+    max_lens = []
+    for idx in range(n):
+        max_t = _fast_max_session_len(dataset, idx)
+        max_lens.append((idx, max_t, 4.0))  # (idx, max_T, weight=4.0)
+
+    max_lens.sort(key=lambda x: x[1])
+
+    bucket_size = max(1, n // num_buckets)
+    batches = []
+    for b in range(0, n, bucket_size):
+        bucket = max_lens[b:b + bucket_size]
+        rng.shuffle(bucket)
+
+        # Dynamic batch size: aim for ~batch_size * median_T total frames per batch
+        bucket_Ts = [t for _, t, _ in bucket]
+        median_T = bucket_Ts[len(bucket_Ts) // 2]
+        target_total = batch_size * 400  # 400 ≈ overall median T
+        dyn_bs = max(2, min(batch_size, int(target_total / max(median_T, 1))))
+        dyn_bs = min(dyn_bs, len(bucket))  # can't exceed bucket size
+
+        indices = [idx for idx, _, _ in bucket]
+        for start in range(0, len(indices), dyn_bs):
+            batch = indices[start:start + dyn_bs]
+            if len(batch) >= 2:
+                batches.append(batch)
+
+    rng.shuffle(batches)
+    return batches
+
+
+def _fast_max_session_len(dataset: GroupedParticipantDataset, idx: int) -> int:
+    """Get max session length by reading only mel_mfcc/A01 timestamps.
+
+    A01 (reading passage) is always the longest session, so its T is the max.
+    """
+    import numpy as np
+    info = dataset.participants[idx]
+    root = str(dataset.root)
+    split = dataset.split
+
+    if "A01" not in info["sess_rows"]:
+        return 100  # fallback
+
+    row = info["sess_rows"]["A01"]
+    seq_path = (
+        f"{root}/{split}/{row['anon_school']}/{row['anon_class']}/{row['anon_pid']}"
+        f"/audio/mel_mfcc/A01/sequence.npz"
+    )
+    try:
+        with np.load(seq_path) as data:
+            if "timestamps_ms" in data:
+                return len(data["timestamps_ms"])
+            for key in data.keys():
+                arr = data[key]
+                if hasattr(arr, 'shape') and len(arr.shape) >= 1:
+                    return arr.shape[0]
+    except Exception:
+        pass
+    return 100  # fallback
+
+
 def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     B = len(batch)
     all_sessions = []  

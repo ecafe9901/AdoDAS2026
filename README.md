@@ -361,3 +361,51 @@ Supported models and dimensions:
 
 
 
+
+
+export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+export ANTHROPIC_AUTH_TOKEN=sk-8af11503cf7240e582434134d37c44ce
+export ANTHROPIC_MODEL=deepseek-v4-pro[1m]
+export ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro[1m]
+export ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro[1m]
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+export CLAUDE_CODE_SUBAGENT_MODEL=deepseek-v4-flash
+export CLAUDE_CODE_EFFORT_LEVEL=max
+
+
+
+  "claudeCode.environmentVariables": [
+    {
+      "name": "ANTHROPIC_AUTH_TOKEN",
+      "value": "sk-8af11503cf7240e582434134d37c44ce"
+    },
+    {
+      "name": "ANTHROPIC_BASE_URL",
+      "value": "https://api.deepseek.com/anthropic"
+    },
+    {
+      "name": "ANTHROPIC_MODEL",
+      "value": "deepseek-v4-pro[1m]"
+    },
+    {
+      "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "value": "deepseek-v4-flash"
+    },
+        {
+      "name": "CLAUDE_CODE_EFFORT_LEVEL",
+      "value": "max"
+    },
+        {
+      "name": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "value": "deepseek-v4-pro[1m]"
+    },
+        {
+      "name": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "value": "deepseek-v4-pro[1m]"
+    }
+  ],
+
+作者：用户120654517215
+链接：https://juejin.cn/post/7615069320985083958
+来源：稀土掘金
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。

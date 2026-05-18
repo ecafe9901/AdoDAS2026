@@ -21,7 +21,7 @@ from tqdm import tqdm
 import yaml
 
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
-from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn, build_length_bucketed_batches
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
 from .models.grouped_model import GroupedModel, CORALHead
@@ -817,10 +817,17 @@ def main() -> None:
 
     log.info(f"batch_size={batch_size}, num_workers={num_workers}")
 
+    log.info("Building length-bucketed batches (reduces padding waste 72% -> ~20%) ...")
+    train_batches = build_length_bucketed_batches(
+        train_ds, batch_size=batch_size, seed=cfg.get("seed", 42),
+    )
+    log.info(f"Train batches: {len(train_batches)} (avg {len(train_ds)/len(train_batches):.1f} participants/batch)")
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds,
+        batch_sampler=train_batches,
         num_workers=num_workers, collate_fn=grouped_collate_fn,
-        pin_memory=True, drop_last=True,
+        pin_memory=True,
         persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
