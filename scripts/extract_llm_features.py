@@ -33,7 +33,7 @@ urllib3.disable_warnings()
 log = logging.getLogger("extract_llm")
 
 API_URL = "https://api.deepseek.com/v1/chat/completions"
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-8af11503cf7240e582434134d37c44ce")
+API_KEY = os.environ["DEEPSEEK_API_KEY"]
 MODEL = "deepseek-chat"
 
 DASS_ITEMS = [f"d{i:02d}" for i in range(1, 22)]
