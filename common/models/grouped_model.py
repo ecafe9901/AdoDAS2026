@@ -83,7 +83,7 @@ class GroupedModel(nn.Module):
             d_in=d_shared, d_out=d_shared,
             method=aggregator_method, dropout=dropout,
         )
-        self.session_type_head = SessionTypeClassifier(d_in=d_shared)
+        self.session_type_head = SessionTypeClassifier(d_in=d_shared + (64 if d_llm > 0 else 0))
         if d_llm > 0:
             self.llm_proj = nn.Sequential(
                 nn.Linear(d_llm, 64),
@@ -113,6 +113,8 @@ class GroupedModel(nn.Module):
         if self.llm_proj is not None and llm_features is not None:
             llm_emb = self.llm_proj(llm_features.to(participant_repr.dtype))
             participant_repr = torch.cat([participant_repr, llm_emb], dim=-1)
+            # Pad session reprs to same dim so single task_head works for both
+            session_reprs = F.pad(session_reprs, (0, 64))
 
         session_type_logits = self.session_type_head(session_reprs)
 

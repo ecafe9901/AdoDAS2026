@@ -364,8 +364,9 @@ def train_one_epoch_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            _llm = batch.get("llm_features")
             out = grouped_model(flat_batch, B, session_valid,
-                             llm_features=batch.get("llm_features"))
+                                llm_features=_llm.to(device) if _llm is not None else None)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
@@ -457,8 +458,9 @@ def validate_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            _llm = batch.get("llm_features")
             out = grouped_model(flat_batch, B, session_valid,
-                             llm_features=batch.get("llm_features"))
+                                llm_features=_llm.to(device) if _llm is not None else None)
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
@@ -617,8 +619,9 @@ def generate_submission_grouped(
         B = batch["n_participants"]
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            _llm = batch.get("llm_features")
             out = grouped_model(flat_batch, B, session_valid,
-                             llm_features=batch.get("llm_features"))
+                                llm_features=_llm.to(device) if _llm is not None else None)
 
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
@@ -661,8 +664,9 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            _llm = batch.get("llm_features")
             out = grouped_model(flat_batch, B, session_valid,
-                             llm_features=batch.get("llm_features"))
+                                llm_features=_llm.to(device) if _llm is not None else None)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
@@ -689,8 +693,9 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            _llm = batch.get("llm_features")
             out = grouped_model(flat_batch, B, session_valid,
-                             llm_features=batch.get("llm_features"))
+                                llm_features=_llm.to(device) if _llm is not None else None)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
