@@ -99,14 +99,11 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", defaults.mask_policy),
         core_audio=cfg.get("core_audio", defaults.core_audio),
         core_video=cfg.get("core_video", defaults.core_video),
-        use_text_features=cfg.get("use_text_features", defaults.use_text_features),
         use_llm_features=cfg.get("use_llm_features", defaults.use_llm_features),
         llm_feature_dir=cfg.get("llm_feature_dir", defaults.llm_feature_dir),
     )
 
     ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=args.split)
-    if feat_cfg.use_text_features:
-        ds.pre_encode_texts()
     preload = bool(cfg.get("preload", True))
     num_workers = int(cfg.get("num_workers", 8))
     if preload:
@@ -124,11 +121,6 @@ def main() -> None:
     )
 
     dims = ds.feature_dims
-    d_text = 0
-    text_vocab = None
-    if feat_cfg.use_text_features:
-        d_text = 128
-        text_vocab = ds._char_vocab
     d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
     bb_cfg = BackboneConfig(
         audio_group_dims={n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims},
@@ -141,8 +133,6 @@ def main() -> None:
         asp_alpha=cfg.get("asp_alpha", 0.5),
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
-        d_text=d_text,
-        text_vocab=text_vocab,
         d_shared=cfg.get("d_shared", 256),
     )
     grouped_model = GroupedModel(

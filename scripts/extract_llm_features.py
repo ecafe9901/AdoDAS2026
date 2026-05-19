@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Pre-compute LLM-based features from transcripts using DeepSeek API.
+"""Pre-compute LLM-based features from transcripts using calibrated DeepSeek API.
 
-Extracts per-participant:
-  - DASS-21 direct scores (21 values) from the LLM's clinical assessment
-  - Psychological markers: valence, emotion, engagement, richness
-
-Stores results as .npy arrays alongside existing pooled features.
+V2 improvements:
+  - Few-shot calibrated examples to prevent over-scoring
+  - Quality score gating for ASR noise
+  - 47-dim features: 21 DASS + 1 quality + psychological markers
 
 Usage:
   python scripts/extract_llm_features.py \
@@ -38,67 +37,76 @@ MODEL = "deepseek-chat"
 
 DASS_ITEMS = [f"d{i:02d}" for i in range(1, 22)]
 
-_SYSTEM_PROMPT = """You are a clinical psychologist specializing in adolescent mental health assessment.
-Analyze the following three speech transcripts from a Chinese adolescent.
+_FEWSHOT_SYSTEM = """You are a clinical psychologist specializing in Chinese adolescent mental health.
+Assess DASS-21 items from three speech transcripts (B01, B02, B03).
 
-The three responses are:
-- B01: "How was your day yesterday?" (请描述一下，你昨天过的怎么样?)
-- B02: "Happiest memory from the past week" (请描述一下，现在回想最近一周最开心的记忆?)
-- B03: "Saddest memory from the past week" (请描述一下，现在回想最近一周最悲伤的记忆?)
+CALIBRATED EXAMPLES:
 
-Assess the adolescent on the DASS-21 (Depression Anxiety Stress Scales) items.
-Score each item 0-3: 0=not at all, 1=mild/sometimes, 2=moderate/often, 3=severe/almost always.
+Example 1 (healthy, engaged):
+B01:"我昨天过得很好，和同学一起去打篮球了"
+B02:"上周最开心的是考试考了第一名"
+B03:"没有特别悲伤的事"
+→ All 0. Quality=1.0, valence=positive.
 
-Also provide psychological markers:
-- valence: "positive", "negative", or "neutral"
-- primary_emotion: "joy", "sadness", "fear", "anger", "surprise", or "neutral"
-- engagement: "engaged", "withdrawn", or "neutral"
-- richness: "detailed", "minimal", or "avoidant"
+Example 2 (mild depressive symptoms):
+B01:"昨天一般般，没什么特别的"
+B02:"好像没有什么特别开心的"
+B03:"跟朋友吵架了，有点难过"
+→ d13=1 d17=1, others 0. Quality=0.9, valence=negative.
 
-Be objective. Even if transcripts are short, make your best assessment based on available information.
-Return ONLY a JSON object. No explanations."""
+Example 3 (moderate academic stress, social withdrawal):
+B01:"昨天很累，不想说话"
+B02:"没有开心的事"
+B03:"考试没考好，老师批评我了"
+→ d01=2 d02=2 d05=2 d13=1 d14=1, others 0. Quality=0.8, valence=negative.
+
+Example 4 (short answers, possible withdrawal - score CONSERVATIVELY):
+B01:"嗯"
+B02:"不知道"
+B03:"没有"
+→ All 0 or 1 only. Quality=0.3, valence=neutral.
+When transcripts are minimal single-word answers, do NOT assume severe symptoms.
+
+Example 5 (garbled/unintelligible text):
+B01:"呵Q"
+B02:"身份啊"
+B03:"嗯"
+→ All 0. Quality=0.0, valence=neutral.
+Garbled text is NOT evidence of mental health issues.
+
+SCORING RULES:
+- Normal adolescent complaints (exams, arguments, tiredness) → 0-1, NOT 2-3
+- Short transcripts (under 5 chars) → score 0-1 conservatively at most
+- Garbled text → all zeros, quality_score=0.0
+- Only score 2-3 with CLEAR explicit evidence (e.g., "I can't sleep at all", "I cry every day")
+- quality_score: 0.0=garbled, 0.3=minimal/uninterpretable, 0.7=sparse but readable, 1.0=clear
+
+Return ONLY a JSON object. No explanation text outside the JSON."""
 
 
-def build_user_prompt(b01_text: str, b02_text: str, b03_text: str) -> str:
-    return f"""B01 (How was your day?): "{b01_text}"
-B02 (Happiest memory): "{b02_text}"
-B03 (Saddest memory): "{b03_text}"
+def build_user_prompt(b01: str, b02: str, b03: str) -> str:
+    return f"""B01 (How was your day?): "{b01}"
+B02 (Happiest memory): "{b02}"
+B03 (Saddest memory): "{b03}"
 
-Return JSON with keys d01-d21 (int 0-3), valence (str), primary_emotion (str),
-engagement (str), richness (str):"""
+Return JSON with keys: d01-d21 (int 0-3), quality_score (float 0-1), valence (str positive/negative/neutral)."""
 
 
 def call_deepseek(system: str, user: str, max_retries: int = 3) -> dict | None:
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": 500,
-        "temperature": 0.0,
-    }
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    data = {"model": MODEL, "messages": [{"role": "system", "content": system},
+            {"role": "user", "content": user}], "max_tokens": 500, "temperature": 0.0}
 
     for attempt in range(max_retries):
         try:
-            r = requests.post(API_URL, headers=headers, json=data,
-                              timeout=60, verify=False)
+            r = requests.post(API_URL, headers=headers, json=data, timeout=60, verify=False)
             if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"]
-                # Extract JSON from response (may have markdown wrapping)
-                content = content.strip()
+                content = r.json()["choices"][0]["message"]["content"].strip()
                 if content.startswith("```"):
-                    lines = content.split("\n")
-                    content = "\n".join(lines[1:-1])
+                    content = "\n".join(content.split("\n")[1:-1])
                 return json.loads(content)
             elif r.status_code == 429:
-                wait = 2 ** attempt
-                log.warning(f"Rate limited, waiting {wait}s...")
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
             else:
                 log.warning(f"API error {r.status_code}: {r.text[:200]}")
                 time.sleep(1)
@@ -108,40 +116,60 @@ def call_deepseek(system: str, user: str, max_retries: int = 3) -> dict | None:
     return None
 
 
-def encode_markers(result: dict) -> np.ndarray:
-    """Encode psychological markers as a fixed-size float vector."""
+def encode_features(result: dict, b01_len: int, b02_len: int, b03_len: int) -> np.ndarray:
+    """Encode LLM result + transcript quality into 47-dim feature vector."""
+    # 21 DASS scores
+    dass = np.array([float(result.get(k, 0)) for k in DASS_ITEMS], dtype=np.float32)
+    # Clamp to 0-3
+    dass = np.clip(dass, 0, 3)
+
+    # Quality score
+    quality = float(result.get("quality_score", 0.5))
+
+    # Transcript lengths (proxy for ASR quality)
+    lengths = np.array([min(b01_len, 50), min(b02_len, 50), min(b03_len, 50)],
+                       dtype=np.float32) / 50.0
+
+    # Valence
     valence_map = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
-    emotion_map = {"joy": 0, "sadness": 1, "fear": 2, "anger": 3,
-                   "surprise": 4, "neutral": 5}
-    engagement_map = {"engaged": 0, "withdrawn": 1, "neutral": 2}
-    richness_map = {"detailed": 0, "minimal": 1, "avoidant": 2}
+    valence = valence_map.get(result.get("valence", "neutral"), 0.0)
 
-    features = []
-    # Valence (1)
-    features.append(valence_map.get(result.get("valence", "neutral"), 0.0))
-    # Emotion one-hot (6)
-    emo = emotion_map.get(result.get("primary_emotion", "neutral"), 5)
-    emo_onehot = np.zeros(6, dtype=np.float32)
-    emo_onehot[emo] = 1.0
-    features.extend(emo_onehot)
-    # Engagement one-hot (3)
-    eng = engagement_map.get(result.get("engagement", "neutral"), 2)
-    eng_onehot = np.zeros(3, dtype=np.float32)
-    eng_onehot[eng] = 1.0
-    features.extend(eng_onehot)
-    # Richness one-hot (3)
-    rich = richness_map.get(result.get("richness", "minimal"), 1)
-    rich_onehot = np.zeros(3, dtype=np.float32)
-    rich_onehot[rich] = 1.0
-    features.extend(rich_onehot)
-    return np.array(features, dtype=np.float32)  # 1 + 6 + 3 + 3 = 13 dims
+    # Combined: gating signal (low quality → downweight LLM features)
+    gating = quality if quality > 0.3 else 0.1
+    # If all 3 transcripts are very short (<5 chars), gate hard
+    if max(b01_len, b02_len, b03_len) < 5:
+        gating = 0.05
 
+    # Psychological markers (8 dims)
+    markers = np.array([
+        valence,                          # -1/0/+1
+        float(dass[12]),                  # d13 (depression item)
+        float(dass[16]),                  # d17 (agitation item)
+        float(dass[0]),                   # d01 (anxiety item)
+        float(np.mean(dass[:7])),         # avg anxiety cluster
+        float(np.mean(dass[7:14])),       # avg depression cluster
+        float(np.mean(dass[14:])),        # avg stress cluster
+        float(dass.sum()),                # total severity
+    ], dtype=np.float32)
 
-def extract_features(b01_text: str, b02_text: str, b03_text: str) -> dict | None:
-    """Extract LLM features for one participant. Returns None on failure."""
-    user = build_user_prompt(b01_text, b02_text, b03_text)
-    result = call_deepseek(_SYSTEM_PROMPT, user)
-    return result
+    # Normalize
+    markers[4:7] = markers[4:7] / 3.0  # avg clusters to 0-1
+    markers[7] = min(markers[7] / 30.0, 1.0)  # total severity normalized
+
+    # Contrastive features (8 dims): B02 vs B03 comparisons
+    contrastive = np.array([
+        float(b02_len) / max(float(b03_len), 1),  # length ratio
+        float(b01_len) / max((b02_len + b03_len) / 2, 1),  # B01 vs average
+        1.0 if b02_len > 10 and b03_len < 5 else 0.0,  # happy-detailed, sad-minimal
+        1.0 if b02_len < 5 and b03_len > 10 else 0.0,  # happy-absent, sad-detailed
+        1.0 if max(b01_len, b02_len, b03_len) < 5 else 0.0,  # all minimal
+        float(min(b01_len, b02_len, b03_len)) / max(float(max(b01_len, b02_len, b03_len)), 1),
+        valence,
+        gating,
+    ], dtype=np.float32)
+
+    return np.concatenate([dass, [quality], lengths, markers, contrastive])
+    # 21 + 1 + 3 + 8 + 8 = 41 dims
 
 
 def load_transcript(feature_root: Path, split: str, school: str, cls: str,
@@ -153,9 +181,7 @@ def load_transcript(feature_root: Path, split: str, school: str, cls: str,
 
 
 def process_manifest(manifest_path: Path, feature_root: Path, split: str,
-                     output_dir: Path, limit: int = 0,
-                     delay: float = 0.5) -> int:
-    """Process all participants in a manifest CSV."""
+                     output_dir: Path, limit: int = 0, delay: float = 0.5) -> int:
     import pandas as pd
     from tqdm import tqdm
 
@@ -180,23 +206,16 @@ def process_manifest(manifest_path: Path, feature_root: Path, split: str,
         b02 = load_transcript(feature_root, split, school, cls, pid, "B02")
         b03 = load_transcript(feature_root, split, school, cls, pid, "B03")
 
-        if not any([b01, b02, b03]):
-            continue
-
-        result = extract_features(b01, b02, b03)
+        result = call_deepseek(_FEWSHOT_SYSTEM,
+                               build_user_prompt(b01, b02, b03))
         if result is None:
             log.warning(f"Failed for {school}/{cls}/{pid}")
             continue
 
-        # Encode: 21 DASS scores (float) + 13 marker features (float) = 34 dims
-        dass_scores = np.array([float(result.get(k, 0)) for k in DASS_ITEMS],
-                               dtype=np.float32)
-        markers = encode_markers(result)
-        features = np.concatenate([dass_scores, markers])  # (34,)
-
+        features = encode_features(result, len(b01), len(b02), len(b03))
         np.save(out_path, features)
         success += 1
-        time.sleep(delay)  # rate limiting
+        time.sleep(delay)
 
     log.info(f"{split}: {success}/{len(participants)} participants processed")
     return success
@@ -208,20 +227,16 @@ def main():
     parser.add_argument("--feature_root", required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Limit participants (for testing)")
-    parser.add_argument("--delay", type=float, default=0.5,
-                        help="Delay between API calls (seconds)")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--delay", type=float, default=0.5)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-    process_manifest(
-        Path(args.manifest), Path(args.feature_root),
-        args.split, Path(args.output_dir),
-        limit=args.limit, delay=args.delay,
-    )
+    process_manifest(Path(args.manifest), Path(args.feature_root),
+                     args.split, Path(args.output_dir),
+                     limit=args.limit, delay=args.delay)
 
 
 if __name__ == "__main__":

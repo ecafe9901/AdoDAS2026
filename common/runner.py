@@ -802,7 +802,6 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", _defaults.mask_policy),
         core_audio=cfg.get("core_audio", _defaults.core_audio),
         core_video=cfg.get("core_video", _defaults.core_video),
-        use_text_features=cfg.get("use_text_features", _defaults.use_text_features),
         use_llm_features=cfg.get("use_llm_features", _defaults.use_llm_features),
         llm_feature_dir=cfg.get("llm_feature_dir", _defaults.llm_feature_dir),
     )
@@ -817,12 +816,6 @@ def main() -> None:
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
     log.info(f"Train: {len(train_ds)} participants, Val: {len(val_ds)} participants")
-
-    if feat_cfg.use_text_features:
-        log.info("Pre-encoding transcript embeddings ...")
-        n_train = train_ds.pre_encode_texts()
-        n_val = val_ds.pre_encode_texts()
-        log.info(f"Text embeddings encoded: {n_train} train + {n_val} val")
 
     preload = bool(cfg.get("preload", True))
     if preload:
@@ -861,12 +854,6 @@ def main() -> None:
     audio_pooled_group_dims = {n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims}
     video_group_dims = {n: dims[n] for n in feat_cfg.video_features if n in dims}
 
-    d_text = 0
-    text_vocab = None
-    if feat_cfg.use_text_features:
-        d_text = 128
-        text_vocab = train_ds._char_vocab
-
     d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
 
     bb_cfg = BackboneConfig(
@@ -880,8 +867,6 @@ def main() -> None:
         asp_alpha=cfg.get("asp_alpha", 0.5),
         asp_beta=cfg.get("asp_beta", 0.5),
         dropout=cfg.get("dropout", 0.2),
-        d_text=d_text,
-        text_vocab=text_vocab,
         d_shared=cfg.get("d_shared", 256),
     )
 
