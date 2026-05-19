@@ -47,7 +47,7 @@ class _RealtimeFileHandler(logging.FileHandler):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--task", type=str, required=True, choices=["a1", "a2"])
+    p.add_argument("--task", type=str, required=True, choices=["a1", "a2", "joint"])
     p.add_argument("--config", type=str, default="configs/default.yaml")
 
     p.add_argument("--feature_root", type=str, default=None)
@@ -333,6 +333,9 @@ def train_one_epoch_grouped(
     best_metric: float = -1.0,
     label_smoothing: float = 0.0,
     feature_noise_std: float = 0.0,
+    a1_head: nn.Module | None = None,
+    a1_pos_weight: torch.Tensor | None = None,
+    a1_loss_weight: float = 0.3,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -395,24 +398,34 @@ def train_one_epoch_grouped(
                 sess_loss = p_logits.new_zeros(())
                 type_loss = p_logits.new_zeros(())
 
+            # Joint A1 loss
+            a1_loss_val = p_logits.new_zeros(())
+            if a1_head is not None:
+                a1_logits = a1_head(out["participant_repr"])
+                a1_targets = batch["participant_y_a1"].to(device)
+                a1_loss_val = a1_loss(a1_logits, a1_targets,
+                                      pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
+
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+            if a1_head is not None:
+                loss = loss + a1_loss_weight * a1_loss_val
 
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if a1_head is not None:
+                _clip_params += list(a1_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if a1_head is not None:
+                _clip_params += list(a1_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             optimizer.step()
 
         total_loss += loss.item()
@@ -881,18 +894,23 @@ def main() -> None:
 
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
 
-    use_coral = bool(cfg.get("use_coral", False))
-    if task == "a1":
-        bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        task_head = A1Head(head_in_dim, bias_init=bias_init).to(device)
-    else:
-        if use_coral:
-            task_head = CORALHead(head_in_dim).to(device)
-            log.info("Using CORAL head for A2")
-        else:
-            task_head = A2OrdinalHead(head_in_dim).to(device)
+    joint = (task == "joint")
+    bias_init_a1 = _compute_bias_init_a1(manifest_dir / "train.csv")
 
-    n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    a1_head = None
+    a1_pos_weight = None
+    if joint:
+        task_head = A2OrdinalHead(head_in_dim).to(device)
+        a1_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+        log.info("Joint A1+A2 training: A2 + A1")
+    elif task == "a1":
+        task_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+    else:
+        task_head = (CORALHead(head_in_dim) if use_coral else A2OrdinalHead(head_in_dim)).to(device)
+
+    n_params = (sum(p.numel() for p in grouped_model.parameters()) +
+                sum(p.numel() for p in task_head.parameters()) +
+                (sum(p.numel() for p in a1_head.parameters()) if joint else 0))
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -902,16 +920,22 @@ def main() -> None:
 
     grad_clip = cfg.get("grad_clip", 1.0)
     pos_weight_t = None
+    a1_pos_weight = None
     if cfg.get("use_pos_weight", True):
-        if task == "a1":
+        if joint:
+            pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
+            pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
+            a1_pos_weight = torch.tensor(pw, dtype=torch.float32, device=device)
+            log.info(f"A2 pos_weight shape: {pos_weight_t.shape}, A1 pw [D/A/S]: {pw[0]:.2f}/{pw[1]:.2f}/{pw[2]:.2f}")
+        elif task == "a1":
             pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
-            log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
         else:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
-            log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     params = list(grouped_model.parameters()) + list(task_head.parameters())
+    if joint:
+        params += list(a1_head.parameters())
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -962,6 +986,7 @@ def main() -> None:
             best_metric=best_metric,
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
+            a1_head=a1_head, a1_pos_weight=a1_pos_weight,
         )
 
         val_metrics = validate_grouped(
