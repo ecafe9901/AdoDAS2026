@@ -101,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--use_pos_weight", type=int, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
+    p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
 
     return p.parse_args()
 
@@ -448,6 +449,7 @@ def validate_grouped(
     use_amp: bool = False,
     pos_weight=None,
     decode_method: str = "expectation",
+    a1_head: nn.Module | None = None,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
@@ -459,6 +461,8 @@ def validate_grouped(
     all_labels = []
     all_logits = []
     all_sess_preds = []
+    all_a1_probs = []
+    all_a1_labels = []
 
     for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
         flat_batch = _to_device(batch["flat_batch"], device)
@@ -481,6 +485,12 @@ def validate_grouped(
                 loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
 
             s_logits = task_head(out["session_reprs"])
+
+            # A1 (joint mode)
+            if a1_head is not None:
+                a1_probs = torch.sigmoid(a1_head(out["participant_repr"]).float()).cpu().numpy()
+                all_a1_probs.append(a1_probs)
+                all_a1_labels.append(batch["participant_y_a1"].cpu().numpy())
 
         if task == "a1":
             logits_np = p_logits.float().cpu().numpy()
@@ -590,9 +600,17 @@ def validate_grouped(
         bot3 = " ".join(f"d{r+1:02d}={item_qwk[r]:.3f}" for r in ranked[-3:])
         log.info(f"    top3: {top3}  |  bot3: {bot3}")
 
+        a1_f1 = 0.0
+        if all_a1_probs:
+            a1_probs = np.concatenate(all_a1_probs)
+            a1_labels_np = np.concatenate(all_a1_labels)
+            a1_f1 = binary_f1(a1_probs, a1_labels_np)
+            log.info(f"    A1 F1: {a1_f1:.4f}")
+
         return {
             "loss": avg_loss, "mean_qwk": mqwk, "mean_mae": mmae,
             "primary_metric": mqwk, "selected_decode_method": auto_selected_decode,
+            "a1_f1": a1_f1,
         }
 
 
@@ -963,18 +981,37 @@ def main() -> None:
     log.info(f"Feature noise std: {feature_noise_std}")
     log.info(f"Session drop prob: {session_drop_prob}")
 
+    start_epoch = 1
     best_metric = -1.0
+    if cfg.get("resume"):
+        ckpt_path = Path(cfg["resume"])
+        log.info(f"Resuming from {ckpt_path}")
+        state = load_checkpoint(ckpt_path, grouped_model, optimizer)
+        task_head.load_state_dict(state["head_state_dict"])
+        if a1_head is not None:
+            extra = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if "a1_head_state_dict" in extra:
+                a1_head.load_state_dict(extra["a1_head_state_dict"])
+                log.info("Loaded a1_head from checkpoint")
+            else:
+                log.info("a1_head not in checkpoint — training from scratch")
+        start_epoch = state["epoch"] + 1
+        best_metric = state.get("best_metric", -1.0)
+        log.info(f"Resumed from epoch {state['epoch']}, best_metric={best_metric:.4f}")
+
     metric_name = "F1" if task == "a1" else "QWK"
     t_start = time.time()
 
     log.info("=" * 90)
     if task == "a1":
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 raw | F1 sel |  AUROC | F1[D/A/S]       | Time")
+    elif joint:
+        log.info("  Epoch  |    LR     | Train Loss | Val Loss | QWK | MAE | A1 F1 | Time")
     else:
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | mean QWK | mean MAE | Time")
     log.info("=" * 90)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
         train_loss = train_one_epoch_grouped(
@@ -993,6 +1030,7 @@ def main() -> None:
             grouped_model, task_head, val_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
             decode_method=cfg.get("decode_method", "expectation"),
+            a1_head=a1_head,
         )
         scheduler.step()
 
@@ -1015,6 +1053,13 @@ def main() -> None:
                 f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
                 f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
             )
+        elif joint:
+            a1f1 = val_metrics.get("a1_f1", 0.0)
+            log.info(
+                f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                f" {val_metrics['mean_qwk']:.4f}  |  {val_metrics['mean_mae']:.4f}  | A1 {a1f1:.3f} | "
+                f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+            )
         else:
             log.info(
                 f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
@@ -1024,11 +1069,14 @@ def main() -> None:
 
         if is_best:
             best_metric = primary
+            _extra = {"head_state_dict": task_head.state_dict()}
+            if a1_head is not None:
+                _extra["a1_head_state_dict"] = a1_head.state_dict()
             save_checkpoint(
                 run_dirs["checkpoints"] / "best.pt",
                 grouped_model, optimizer, epoch, best_metric,
-                extra={"head_state_dict": task_head.state_dict()},
-            )
+                extra=_extra,
+                )
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
 

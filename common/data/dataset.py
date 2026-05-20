@@ -46,7 +46,7 @@ class FeatureConfig:
     core_video: list[str] = field(default_factory=lambda: ["face_behavior", "headpose_geom"])
     use_llm_features: bool = False
     llm_feature_dir: str = ""
-    llm_feature_dim: int = 34  # 21 DASS + 13 markers (V1 format)
+    llm_feature_dim: int = 74  # 3×(21 DASS + quality + valence) + 5 cross-session
 
     @property
     def audio_sequence_features(self) -> list[str]:
