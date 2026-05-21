@@ -60,6 +60,20 @@ infer.py                                     # standalone inference entry point
 | `common/utils/metrics.py` | `binary_f1`, `mean_qwk`, `mean_mae`, `macro_auroc`, `per_item_qwk` |
 | `public_pipeline/` | Feature extraction pipeline (not needed for training/inference — features are pre-extracted) |
 
+### Future improvement ideas (not yet implemented)
+
+**Transcript metadata (meta.json, segments.json):**
+- `audio_duration`: per-session audio length (B03 systematically shorter → avoidance signal)
+- `has_exact_segments` / `n_segments`: ASR quality gate
+- `question_id` (B01/B02/B03): embedding for session-type-aware processing
+- Cross-session duration ratios (B03/B01, B02-B03 length) → emotional engagement proxy
+- SenseVoice emotion tags (NEUTRAL 87%, SAD 4.5%, HAPPY 3%, EMO_UNKNOWN 5%): time-aligned audio emotion → add as per-frame bias in ASP attention
+
+**Architecture improvements:**
+- Cross-modal attention (audio↔video) before ASP — biggest single gain potential
+- Transformer-based session aggregator (4 session self-attention)
+- d_model 256→384: headroom for larger capacity (VRAM only 9GB/16GB)
+
 ### Configuration
 
 YAML config files are at `tasks/<a1|a2>/default.yaml`. CLI args override YAML values. The `feature_selection` block in YAML is flattened into the top-level config dict. `FeatureConfig` dataclass defines defaults for all feature-related settings.
