@@ -178,12 +178,6 @@ class MTCNBackbone(nn.Module):
         self.audio_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
         self.video_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
 
-        # Cross-modal attention
-        self.cross_attn_a2v = nn.MultiheadAttention(cfg.d_model, num_heads=1,
-                                                      batch_first=True, dropout=cfg.dropout)
-        self.cross_attn_v2a = nn.MultiheadAttention(cfg.d_model, num_heads=1,
-                                                      batch_first=True, dropout=cfg.dropout)
-
         fusion_in = 2 * cfg.d_model * 2
         fusion_in += len(self.audio_pooled_group_names) * cfg.d_adapter
         fusion_in += cfg.d_session 
@@ -228,12 +222,6 @@ class MTCNBackbone(nn.Module):
 
         a = self.audio_tcn(a, mask_a)
         v = self.video_tcn(v, mask_v)
-
-        # Cross-modal attention: audio attends to video, video attends to audio
-        a2v, _ = self.cross_attn_a2v(a, v, v, key_padding_mask=~mask_a)
-        v2a, _ = self.cross_attn_v2a(v, a, a, key_padding_mask=~mask_v)
-        a = a + a2v
-        v = v + v2a
 
         vad = batch["vad_signal"]
         qc = batch["qc_quality"]
