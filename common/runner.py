@@ -362,6 +362,25 @@ def train_one_epoch_grouped(
                         flat_batch[key][name]
                     ) * feature_noise_std * noise_mask
 
+        # SpecAugment: time/frequency masking on mel_mfcc only
+        if "mel_mfcc" in flat_batch.get("audio_groups", {}):
+            mel = flat_batch["audio_groups"]["mel_mfcc"]  # (N, T, 93)
+            valid_mask = (~flat_batch["pad_mask"]).float()
+            N, T, F = mel.shape
+            # Time mask: zero out up to 20 consecutive frames
+            t_mask_size = min(20, T // 3)
+            for i in range(N):
+                if valid_mask[i].sum() < t_mask_size * 2:
+                    continue
+                t_start = torch.randint(0, max(1, int(valid_mask[i].sum().item()) - t_mask_size), (1,)).item()
+                mel[i, t_start:t_start + t_mask_size] = 0
+            # Frequency mask: zero out up to 10 mel bins
+            f_mask_size = min(10, F // 3)
+            if torch.rand(1).item() < 0.5:
+                for i in range(N):
+                    f_start = torch.randint(0, F - f_mask_size, (1,)).item()
+                    mel[i, :, f_start:f_start + f_mask_size] = 0
+
         if task == "a1":
             targets = batch["participant_y_a1"].to(device)
         else:
