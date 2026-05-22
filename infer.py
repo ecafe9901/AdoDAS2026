@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 import yaml
 
 from common.data.dataset import FeatureConfig
-from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn, build_length_bucketed_batches
 from common.models.grouped_model import CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
@@ -26,11 +26,12 @@ from common.utils.ckpt import load_checkpoint
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", required=True, choices=["a1", "a2"])
+    parser.add_argument("--task", required=True, choices=["a1", "a2", "joint"])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default=None)
     parser.add_argument("--split", default="test_hidden")
     parser.add_argument("--manifest", default=None)
+    parser.add_argument("--feature_root", default=None)
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -91,7 +92,7 @@ def main() -> None:
 
     defaults = FeatureConfig()
     feat_cfg = FeatureConfig(
-        feature_root=cfg.get("feature_root", defaults.feature_root),
+        feature_root=args.feature_root or cfg.get("feature_root", defaults.feature_root),
         audio_features=cfg.get("audio_features", defaults.audio_features),
         video_features=cfg.get("video_features", defaults.video_features),
         audio_ssl_model_tag=cfg.get("audio_ssl_model_tag", defaults.audio_ssl_model_tag),
@@ -110,10 +111,12 @@ def main() -> None:
         ds.preload(desc=f"Preload {args.split}")
         num_workers = 0
 
+    # Use bucketed batches to prevent OOM (inference batch_size can be larger)
+    infer_batches = build_length_bucketed_batches(
+        ds, batch_size=int(cfg.get("batch_size", 64)), seed=42)
     loader = DataLoader(
         ds,
-        batch_size=int(cfg.get("batch_size", 64)),
-        shuffle=False,
+        batch_sampler=infer_batches,
         num_workers=num_workers,
         collate_fn=grouped_collate_fn,
         pin_memory=True,
@@ -146,6 +149,8 @@ def main() -> None:
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
     if args.task == "a1":
         task_head = A1Head(head_in_dim).to(device)
+    elif args.task == "joint":
+        task_head = A2OrdinalHead(head_in_dim).to(device)
     else:
         if bool(cfg.get("use_coral", False)):
             task_head = CORALHead(head_in_dim).to(device)
@@ -154,6 +159,10 @@ def main() -> None:
 
     state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])
+    a1_head = None
+    if args.task == "joint" and "a1_head_state_dict" in state:
+        a1_head = A1Head(head_in_dim).to(device)
+        a1_head.load_state_dict(state["a1_head_state_dict"])
     grouped_model.eval()
     task_head.eval()
 
@@ -161,7 +170,7 @@ def main() -> None:
     use_amp = bool(cfg.get("amp", True))
     submission_level = cfg.get("submission_level", "participant")
 
-    pids, sessions, preds = generate_submission_grouped(
+    result = generate_submission_grouped(
         grouped_model=grouped_model,
         task_head=task_head,
         loader=loader,
@@ -173,7 +182,12 @@ def main() -> None:
         a1_biases=None if a1_biases is None else a1_biases.to(device),
         decode_method=selected_decode_method,
         a2_threshold_offsets=None if a2_offsets is None else a2_offsets.to(device),
+        a1_head=a1_head,
     )
+    if args.task == "joint" and a1_head is not None:
+        pids, sessions, preds, a1_preds = result
+    else:
+        pids, sessions, preds = result
 
     manifest_df = pd.read_csv(manifest_path)
     file_ids = []
@@ -228,6 +242,28 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sub.to_csv(output_path, index=False)
     print(output_path)
+
+    # A1 submission (joint mode)
+    if args.task == "joint" and a1_head is not None:
+        a1_file_ids = []
+        a1_filtered = []
+        # Re-use the same ID mapping
+        if submission_level == "participant":
+            for pid, pred in zip(pids, a1_preds):
+                info = pid_to_info.get(str(pid))
+                if info is None: continue
+                school, cls = info
+                a1_file_ids.append(f"{school}_{cls}_{str(pid)}")
+                a1_filtered.append(pred)
+        sub_a1 = pd.DataFrame({
+            "file_id": a1_file_ids,
+            "p_D": [float(p[0]) for p in a1_filtered],
+            "p_A": [float(p[1]) for p in a1_filtered],
+            "p_S": [float(p[2]) for p in a1_filtered],
+        })
+        a1_path = run_dir / "submissions" / f"submission_a1_{args.split}.csv"
+        sub_a1.to_csv(a1_path, index=False)
+        print(a1_path)
 
 
 if __name__ == "__main__":

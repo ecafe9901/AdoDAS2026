@@ -628,9 +628,11 @@ def generate_submission_grouped(
     a1_biases: np.ndarray | None = None,
     decode_method: str = "expectation",
     a2_threshold_offsets: np.ndarray | None = None,
+    a1_head: nn.Module | None = None,
 ):
     grouped_model.eval()
     task_head.eval()
+    joint = (task == "joint" and a1_head is not None)
     decode_method = _normalize_decode_method(decode_method)
     if submission_level not in {"participant", "session"}:
         raise ValueError("submission_level must be 'participant' or 'session'")
@@ -638,6 +640,7 @@ def generate_submission_grouped(
     all_pids = []
     all_sessions = []
     all_preds = []
+    all_a1_preds = []
     a1_biases_t = None if a1_biases is None else torch.as_tensor(a1_biases, device=device, dtype=torch.float32)
     a2_offsets_t = (
         None if a2_threshold_offsets is None
@@ -679,6 +682,17 @@ def generate_submission_grouped(
             all_sessions.extend(batch["flat_sessions"])
         all_preds.append(preds)
 
+        # A1 predictions (joint mode)
+        if joint and a1_head is not None:
+            a1_logits = a1_head(out["participant_repr"]).float()
+            if a1_biases_t is not None:
+                a1_logits = a1_logits + a1_biases_t
+            a1_probs = torch.sigmoid(a1_logits).cpu().numpy()
+            all_a1_preds.append(a1_probs)
+
+    if joint:
+        return (all_pids, all_sessions, np.concatenate(all_preds),
+                np.concatenate(all_a1_preds))
     return all_pids, all_sessions, np.concatenate(all_preds)
 
 
@@ -1227,14 +1241,19 @@ def main() -> None:
                 num_workers=num_workers, collate_fn=grouped_collate_fn,
             )
 
-            pids, sessions, preds = generate_submission_grouped(
+            result = generate_submission_grouped(
                 grouped_model, task_head, loader, device, task, use_amp,
                 desc=f"Submit {split_name}",
                 submission_level=submission_level,
                 a1_biases=a1_biases,
                 decode_method=selected_decode_method,
                 a2_threshold_offsets=a2_offsets,
+                a1_head=a1_head,
             )
+            if joint and a1_head is not None:
+                pids, sessions, preds, a1_preds = result
+            else:
+                pids, sessions, preds = result
 
             manifest_df = pd.read_csv(manifest_path)
             file_ids = []
@@ -1298,6 +1317,21 @@ def main() -> None:
             out_path = run_dirs["submissions"] / f"submission_{task}_{split_name}.csv"
             sub.to_csv(out_path, index=False)
             log.info(f"Wrote {len(sub)} rows to {out_path}")
+
+            # A1 submission for joint mode
+            if joint and "a1_preds" in dir() and len(a1_preds) > 0:
+                a1_filtered = [a1_preds[i] for i in range(len(a1_preds))
+                               if file_ids[i] in set(file_ids)]
+                if len(a1_filtered) == len(file_ids):
+                    sub_a1 = pd.DataFrame({
+                        "file_id": file_ids,
+                        "p_D": np.asarray(a1_filtered)[:, 0],
+                        "p_A": np.asarray(a1_filtered)[:, 1],
+                        "p_S": np.asarray(a1_filtered)[:, 2],
+                    })
+                    a1_path = run_dirs["submissions"] / f"submission_a1_{split_name}.csv"
+                    sub_a1.to_csv(a1_path, index=False)
+                    log.info(f"Wrote {len(sub_a1)} rows to {a1_path}")
     else:
         log.info("Skipping submission generation after training; use infer.py for release inference.")
 
