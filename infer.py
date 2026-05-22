@@ -256,18 +256,21 @@ def main() -> None:
 
     # A1 submission (joint mode)
     if args.task == "joint" and a1_head is not None:
-        a1_file_ids = []
+        a1_schools, a1_classes, a1_pids = [], [], []
         a1_filtered = []
-        # Re-use the same ID mapping
         if submission_level == "participant":
             for pid, pred in zip(pids, a1_preds):
                 info = pid_to_info.get(str(pid))
                 if info is None: continue
                 school, cls = info
-                a1_file_ids.append(f"{school}_{cls}_{str(pid)}")
+                a1_schools.append(school)
+                a1_classes.append(cls)
+                a1_pids.append(str(pid))
                 a1_filtered.append(pred)
         sub_a1 = pd.DataFrame({
-            "file_id": a1_file_ids,
+            "anon_school": a1_schools,
+            "anon_class": a1_classes,
+            "anon_pid": a1_pids,
             "p_D": [float(p[0]) for p in a1_filtered],
             "p_A": [float(p[1]) for p in a1_filtered],
             "p_S": [float(p[2]) for p in a1_filtered],
