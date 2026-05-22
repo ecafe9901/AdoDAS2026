@@ -224,17 +224,28 @@ def main() -> None:
             file_ids.append(f"{school}_{cls}_{key[0]}_{key[1]}")
             filtered_preds.append(pred)
 
+    # Split file_id into school/class/pid
+    schools, classes, pids = [], [], []
+    for fid in file_ids:
+        parts = fid.split("_")
+        schools.append(f"{parts[0]}_{parts[1]}")
+        classes.append(f"{parts[2]}_{parts[3]}")
+        pids.append("_".join(parts[4:]))
+
     if args.task == "a1":
-        sub = pd.DataFrame(
-            {
-                "file_id": file_ids,
-                "p_D": [float(pred[0]) for pred in filtered_preds],
-                "p_A": [float(pred[1]) for pred in filtered_preds],
-                "p_S": [float(pred[2]) for pred in filtered_preds],
-            }
-        )
+        sub = pd.DataFrame({
+            "anon_school": schools,
+            "anon_class": classes,
+            "anon_pid": pids,
+            "p_D": [float(pred[0]) for pred in filtered_preds],
+            "p_A": [float(pred[1]) for pred in filtered_preds],
+            "p_S": [float(pred[2]) for pred in filtered_preds],
+        })
     else:
-        sub = pd.DataFrame({"file_id": file_ids})
+        sub = pd.DataFrame({
+            "anon_school": schools,
+            "anon_class": classes,
+        "anon_pid": pids})
         for idx, col in enumerate([f"d{i:02d}" for i in range(1, 22)]):
             sub[col] = [int(pred[idx]) for pred in filtered_preds]
 

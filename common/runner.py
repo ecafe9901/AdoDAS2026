@@ -684,7 +684,7 @@ def generate_submission_grouped(
 
         # A1 predictions (joint mode)
         if joint and a1_head is not None:
-            a1_logits = a1_head(out["participant_repr"]).float()
+            a1_logits = a1_head(out["participant_repr"].float())
             if a1_biases_t is not None:
                 a1_logits = a1_logits + a1_biases_t
             a1_probs = torch.sigmoid(a1_logits).cpu().numpy()
@@ -1301,16 +1301,21 @@ def main() -> None:
                     f"Submission row count mismatch for {split_name}: expected={expected_rows} generated={len(file_ids)}"
                 )
 
+            schools, classes, pids = [], [], []
+            for fid in file_ids:
+                parts = fid.split("_")
+                schools.append(f"{parts[0]}_{parts[1]}")
+                classes.append(f"{parts[2]}_{parts[3]}")
+                pids.append("_".join(parts[4:]))
+
             if task == "a1":
                 sub = pd.DataFrame({
-                    "file_id": file_ids,
-                    "p_D": preds[:, 0],
-                    "p_A": preds[:, 1],
-                    "p_S": preds[:, 2],
+                    "anon_school": schools, "anon_class": classes, "anon_pid": pids,
+                    "p_D": preds[:, 0], "p_A": preds[:, 1], "p_S": preds[:, 2],
                 })
             else:
                 item_cols = [f"d{i:02d}" for i in range(1, 22)]
-                sub = pd.DataFrame({"file_id": file_ids})
+                sub = pd.DataFrame({"anon_school": schools, "anon_class": classes, "anon_pid": pids})
                 for j, col in enumerate(item_cols):
                     sub[col] = preds[:, j]
 
@@ -1324,7 +1329,7 @@ def main() -> None:
                                if file_ids[i] in set(file_ids)]
                 if len(a1_filtered) == len(file_ids):
                     sub_a1 = pd.DataFrame({
-                        "file_id": file_ids,
+                        "anon_school": schools, "anon_class": classes, "anon_pid": pids,
                         "p_D": np.asarray(a1_filtered)[:, 0],
                         "p_A": np.asarray(a1_filtered)[:, 1],
                         "p_S": np.asarray(a1_filtered)[:, 2],
