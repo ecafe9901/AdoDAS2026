@@ -125,6 +125,10 @@ def main() -> None:
 
     dims = ds.feature_dims
     d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
+    llm_offset = 0
+    if args.task == "a2" and feat_cfg.use_llm_features:
+        llm_offset = 21
+        d_llm = 13
     bb_cfg = BackboneConfig(
         audio_group_dims={n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims},
         audio_pooled_group_dims={n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims},
@@ -144,6 +148,7 @@ def main() -> None:
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
+        llm_offset=llm_offset,
     ).to(device)
 
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)

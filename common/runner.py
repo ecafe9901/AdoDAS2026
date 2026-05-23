@@ -337,6 +337,7 @@ def train_one_epoch_grouped(
     a1_head: nn.Module | None = None,
     a1_pos_weight: torch.Tensor | None = None,
     a1_loss_weight: float = 0.3,
+    gamma: float = 0.0,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -378,18 +379,29 @@ def train_one_epoch_grouped(
             if task == "a1":
                 main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
             else:
-                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing, gamma=gamma)
 
             if has_valid_sessions:
                 s_logits = task_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
-                    sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
                 else:
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
-                    sess_loss = a2_ordinal_loss(
-                        s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing
-                    )
+
+                # Exclude A01 (neutral reading) from session auxiliary loss —
+                # it contains no clinical signal and forcing item predictions
+                # from reading-aloud content produces noisy gradients.
+                is_clinical = session_types[valid_session_mask] != 0  # A01=0
+                if is_clinical.any():
+                    if task == "a1":
+                        sess_loss = a1_loss(s_logits[is_clinical], s_targets[is_clinical],
+                                           pos_weight=pos_weight, label_smoothing=label_smoothing)
+                    else:
+                        sess_loss = a2_ordinal_loss(s_logits[is_clinical], s_targets[is_clinical],
+                                                    pos_weight=pos_weight, label_smoothing=label_smoothing,
+                                                    gamma=gamma)
+                else:
+                    sess_loss = p_logits.new_zeros(())
 
                 type_loss = F.cross_entropy(
                     out["session_type_logits"][valid_session_mask],
@@ -419,7 +431,14 @@ def train_one_epoch_grouped(
             if a1_head is not None:
                 _clip_params += list(a1_head.parameters())
             nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
-            scaler.step(optimizer)
+            grads_finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for pg in optimizer.param_groups for p in pg["params"] if p.grad is not None
+            )
+            if grads_finite:
+                scaler.step(optimizer)
+            else:
+                optimizer.zero_grad()
             scaler.update()
         else:
             loss.backward()
@@ -427,7 +446,14 @@ def train_one_epoch_grouped(
             if a1_head is not None:
                 _clip_params += list(a1_head.parameters())
             nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
-            optimizer.step()
+            grads_finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for pg in optimizer.param_groups for p in pg["params"] if p.grad is not None
+            )
+            if grads_finite:
+                optimizer.step()
+            else:
+                optimizer.zero_grad()
 
         total_loss += loss.item()
         n_batches += 1
@@ -900,6 +926,10 @@ def main() -> None:
     video_group_dims = {n: dims[n] for n in feat_cfg.video_features if n in dims}
 
     d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
+    llm_offset = 0
+    if task == "a2" and feat_cfg.use_llm_features:
+        llm_offset = 21  # skip DASS items, use only behavioral markers (13 dims)
+        d_llm = 13
 
     bb_cfg = BackboneConfig(
         audio_group_dims=audio_group_dims,
@@ -922,6 +952,7 @@ def main() -> None:
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
+        llm_offset=llm_offset,
     ).to(device)
 
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
@@ -938,7 +969,7 @@ def main() -> None:
     elif task == "a1":
         task_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
     else:
-        task_head = (CORALHead(head_in_dim) if use_coral else A2OrdinalHead(head_in_dim)).to(device)
+        task_head = (CORALHead(head_in_dim) if bool(cfg.get("use_coral", False)) else A2OrdinalHead(head_in_dim)).to(device)
 
     n_params = (sum(p.numel() for p in grouped_model.parameters()) +
                 sum(p.numel() for p in task_head.parameters()) +
@@ -1038,6 +1069,7 @@ def main() -> None:
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
             a1_head=a1_head, a1_pos_weight=a1_pos_weight,
+            gamma=cfg.get("gamma", 0.0),
         )
 
         val_metrics = validate_grouped(

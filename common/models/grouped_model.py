@@ -75,10 +75,12 @@ class GroupedModel(nn.Module):
         aggregator_method: str = "mlp",
         dropout: float = 0.2,
         d_llm: int = 0,
+        llm_offset: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
         self.d_llm = d_llm
+        self.llm_offset = llm_offset
         self.aggregator = ParticipantAggregator(
             d_in=d_shared, d_out=d_shared,
             method=aggregator_method, dropout=dropout,
@@ -111,7 +113,8 @@ class GroupedModel(nn.Module):
 
         # Fuse LLM features at participant level
         if self.llm_proj is not None and llm_features is not None:
-            llm_emb = self.llm_proj(llm_features.to(participant_repr.dtype))
+            sliced = llm_features[:, self.llm_offset:self.llm_offset + self.d_llm]
+            llm_emb = self.llm_proj(sliced.to(participant_repr.dtype))
             participant_repr = torch.cat([participant_repr, llm_emb], dim=-1)
             # Pad session reprs to same dim so single task_head works for both
             session_reprs = F.pad(session_reprs, (0, 64))

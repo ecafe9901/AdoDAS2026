@@ -476,7 +476,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         result = {}
         for n in names:
             D = all_sessions[0][key][n].shape[-1]
-            t = torch.zeros(n_flat, T_max, D)
+            t = torch.zeros(n_flat, T_max, D, dtype=all_sessions[0][key][n].dtype)
             for i, s in enumerate(all_sessions):
                 L = s["seq_len"]
                 t[i, :L] = s[key][n]
@@ -549,8 +549,8 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
     """Create a zero-filled dummy session matching reference dims."""
     T = 1  # minimal length
-    audio_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["audio_groups"].items()}
-    video_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["video_groups"].items()}
+    audio_groups = {k: torch.zeros(T, v.shape[-1], dtype=v.dtype) for k, v in ref["audio_groups"].items()}
+    video_groups = {k: torch.zeros(T, v.shape[-1], dtype=v.dtype) for k, v in ref["video_groups"].items()}
     dummy = {
         "audio_groups": audio_groups,
         "audio_pooled_groups": {
