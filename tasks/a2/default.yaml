@@ -1,4 +1,4 @@
-feature_root: /mnt/data/datasets/AdoDAS/Train
+feature_root: /home/mediax/Train_NVMe
 manifest_dir: /mnt/data/datasets/AdoDAS/manifests
 output_dir: /mnt/data/datasets/AdoDAS/output/a2
 
@@ -34,19 +34,19 @@ d_shared: 256
 
 aggregator: mlp
 use_coral: true
-batch_size: 32
+batch_size: 24
 lr: 0.001
 weight_decay: 0.02
-warmup_epochs: 3
+warmup_epochs: 2
 epochs: 25
 seed: 42
-num_workers: 8
+num_workers: 4
 amp: true
 preload: false
 grad_clip: 1.0
-use_pos_weight: true
+use_pos_weight: false
 patience: 10
-session_loss_weight: 1.0
+session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 gamma: 0.0
 use_llm_features: true
