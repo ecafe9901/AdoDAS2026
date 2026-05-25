@@ -257,7 +257,18 @@ class GroupedParticipantDataset(Dataset):
                 sessions_data.append(None)
                 session_valid.append(False)
 
-        return {
+        # LLM features (per-participant, loaded from .npy)
+        llm_features = None
+        if self.cfg.use_llm_features and self.cfg.llm_feature_dir:
+            llm_dir = Path(self.cfg.llm_feature_dir) / self.split
+            llm_path = llm_dir / f"{info['anon_school']}_{info['anon_class']}_{info['anon_pid']}.npy"
+            if llm_path.exists():
+                try:
+                    llm_features = torch.from_numpy(np.load(llm_path))
+                except Exception:
+                    pass
+
+        result = {
             "sessions": sessions_data,
             "session_valid": np.array(session_valid, dtype=bool),
             "y_a1": torch.from_numpy(info["y_a1"]),
@@ -267,6 +278,9 @@ class GroupedParticipantDataset(Dataset):
             "anon_class": info["anon_class"],
             "session_names": SESSIONS,
         }
+        if llm_features is not None:
+            result["llm_features"] = llm_features
+        return result
 
     def _apply_session_dropout(self, sample: dict[str, Any]) -> dict[str, Any]:
         valid_indices = [
@@ -331,6 +345,84 @@ class GroupedParticipantDataset(Dataset):
         return self._cache is not None
 
 
+def build_length_bucketed_batches(
+    dataset: GroupedParticipantDataset,
+    batch_size: int,
+    num_buckets: int = 10,
+    seed: int = 42,
+) -> list[list[int]]:
+    """Build batches where participants have similar max session lengths.
+
+    Dynamically adjusts batch size per bucket: short-session buckets use
+    larger batches, long-session buckets use smaller batches. Targets
+    the same memory footprint per batch.
+    """
+    import random as _random
+    import math
+    rng = _random.Random(seed)
+
+    n = len(dataset)
+    max_lens = []
+    for idx in range(n):
+        max_t = _fast_max_session_len(dataset, idx)
+        max_lens.append((idx, max_t, 4.0))  # (idx, max_T, weight=4.0)
+
+    max_lens.sort(key=lambda x: x[1])
+
+    bucket_size = max(1, n // num_buckets)
+    batches = []
+    for b in range(0, n, bucket_size):
+        bucket = max_lens[b:b + bucket_size]
+        rng.shuffle(bucket)
+
+        # Dynamic batch size: aim for ~batch_size * median_T total frames per batch
+        bucket_Ts = [t for _, t, _ in bucket]
+        median_T = bucket_Ts[len(bucket_Ts) // 2]
+        target_total = batch_size * 400  # 400 ≈ overall median T
+        dyn_bs = max(2, min(batch_size, int(target_total / max(median_T, 1))))
+        dyn_bs = min(dyn_bs, len(bucket))  # can't exceed bucket size
+
+        indices = [idx for idx, _, _ in bucket]
+        for start in range(0, len(indices), dyn_bs):
+            batch = indices[start:start + dyn_bs]
+            if len(batch) >= 2:
+                batches.append(batch)
+
+    rng.shuffle(batches)
+    return batches
+
+
+def _fast_max_session_len(dataset: GroupedParticipantDataset, idx: int) -> int:
+    """Get max session length by reading only mel_mfcc/A01 timestamps.
+
+    A01 (reading passage) is always the longest session, so its T is the max.
+    """
+    import numpy as np
+    info = dataset.participants[idx]
+    root = str(dataset.root)
+    split = dataset.split
+
+    if "A01" not in info["sess_rows"]:
+        return 100  # fallback
+
+    row = info["sess_rows"]["A01"]
+    seq_path = (
+        f"{root}/{split}/{row['anon_school']}/{row['anon_class']}/{row['anon_pid']}"
+        f"/audio/mel_mfcc/A01/sequence.npz"
+    )
+    try:
+        with np.load(seq_path) as data:
+            if "timestamps_ms" in data:
+                return len(data["timestamps_ms"])
+            for key in data.keys():
+                arr = data[key]
+                if hasattr(arr, 'shape') and len(arr.shape) >= 1:
+                    return arr.shape[0]
+    except Exception:
+        pass
+    return 100  # fallback
+
+
 def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     B = len(batch)
     all_sessions = []  
@@ -384,7 +476,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         result = {}
         for n in names:
             D = all_sessions[0][key][n].shape[-1]
-            t = torch.zeros(n_flat, T_max, D)
+            t = torch.zeros(n_flat, T_max, D, dtype=all_sessions[0][key][n].dtype)
             for i, s in enumerate(all_sessions):
                 L = s["seq_len"]
                 t[i, :L] = s[key][n]
@@ -427,6 +519,17 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "session": flat_sess_names,
     }
 
+    # LLM features (per-participant pooled features)
+    llm_features_list = [b.get("llm_features") for b in batch]
+    llm_features = None
+    if any(f is not None for f in llm_features_list):
+        # Fill missing with zeros
+        dim = next(f.shape[0] for f in llm_features_list if f is not None)
+        llm_features = torch.stack([
+            f if f is not None else torch.zeros(dim)
+            for f in llm_features_list
+        ])
+
     return {
         "flat_batch": flat_batch,
         "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),
@@ -439,15 +542,16 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "anon_classes": [b["anon_class"] for b in batch],
         "flat_sessions": flat_sess_names,
         "flat_pids": flat_pids,
+        "llm_features": llm_features,
     }
 
 
 def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
     """Create a zero-filled dummy session matching reference dims."""
     T = 1  # minimal length
-    audio_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["audio_groups"].items()}
-    video_groups = {k: torch.zeros(T, v.shape[-1]) for k, v in ref["video_groups"].items()}
-    return {
+    audio_groups = {k: torch.zeros(T, v.shape[-1], dtype=v.dtype) for k, v in ref["audio_groups"].items()}
+    video_groups = {k: torch.zeros(T, v.shape[-1], dtype=v.dtype) for k, v in ref["video_groups"].items()}
+    dummy = {
         "audio_groups": audio_groups,
         "audio_pooled_groups": {
             k: torch.zeros_like(v) for k, v in ref["audio_pooled_groups"].items()
@@ -464,3 +568,4 @@ def _make_dummy_session(ref: dict[str, Any]) -> dict[str, Any]:
         "seq_len": T,
         "session": "A01",
     }
+    return dummy

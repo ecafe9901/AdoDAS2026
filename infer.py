@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 import yaml
 
 from common.data.dataset import FeatureConfig
-from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn, build_length_bucketed_batches
 from common.models.grouped_model import CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
@@ -26,11 +26,12 @@ from common.utils.ckpt import load_checkpoint
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", required=True, choices=["a1", "a2"])
+    parser.add_argument("--task", required=True, choices=["a1", "a2", "joint"])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default=None)
     parser.add_argument("--split", default="test_hidden")
     parser.add_argument("--manifest", default=None)
+    parser.add_argument("--feature_root", default=None)
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -91,7 +92,7 @@ def main() -> None:
 
     defaults = FeatureConfig()
     feat_cfg = FeatureConfig(
-        feature_root=cfg.get("feature_root", defaults.feature_root),
+        feature_root=args.feature_root or cfg.get("feature_root", defaults.feature_root),
         audio_features=cfg.get("audio_features", defaults.audio_features),
         video_features=cfg.get("video_features", defaults.video_features),
         audio_ssl_model_tag=cfg.get("audio_ssl_model_tag", defaults.audio_ssl_model_tag),
@@ -99,6 +100,8 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", defaults.mask_policy),
         core_audio=cfg.get("core_audio", defaults.core_audio),
         core_video=cfg.get("core_video", defaults.core_video),
+        use_llm_features=cfg.get("use_llm_features", defaults.use_llm_features),
+        llm_feature_dir=cfg.get("llm_feature_dir", defaults.llm_feature_dir),
     )
 
     ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=args.split)
@@ -108,10 +111,12 @@ def main() -> None:
         ds.preload(desc=f"Preload {args.split}")
         num_workers = 0
 
+    # Use bucketed batches to prevent OOM (inference batch_size can be larger)
+    infer_batches = build_length_bucketed_batches(
+        ds, batch_size=int(cfg.get("batch_size", 64)), seed=42)
     loader = DataLoader(
         ds,
-        batch_size=int(cfg.get("batch_size", 64)),
-        shuffle=False,
+        batch_sampler=infer_batches,
         num_workers=num_workers,
         collate_fn=grouped_collate_fn,
         pin_memory=True,
@@ -119,6 +124,11 @@ def main() -> None:
     )
 
     dims = ds.feature_dims
+    d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
+    llm_offset = 0
+    if args.task == "a2" and feat_cfg.use_llm_features:
+        llm_offset = 21
+        d_llm = 13
     bb_cfg = BackboneConfig(
         audio_group_dims={n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims},
         audio_pooled_group_dims={n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims},
@@ -137,18 +147,27 @@ def main() -> None:
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        d_llm=d_llm,
+        llm_offset=llm_offset,
     ).to(device)
 
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
     if args.task == "a1":
-        task_head = A1Head(bb_cfg.d_shared).to(device)
+        task_head = A1Head(head_in_dim).to(device)
+    elif args.task == "joint":
+        task_head = A2OrdinalHead(head_in_dim).to(device)
     else:
         if bool(cfg.get("use_coral", False)):
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
+            task_head = CORALHead(head_in_dim).to(device)
         else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            task_head = A2OrdinalHead(head_in_dim).to(device)
 
     state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])
+    a1_head = None
+    if args.task == "joint" and "a1_head_state_dict" in state:
+        a1_head = A1Head(head_in_dim).to(device)
+        a1_head.load_state_dict(state["a1_head_state_dict"])
     grouped_model.eval()
     task_head.eval()
 
@@ -156,7 +175,7 @@ def main() -> None:
     use_amp = bool(cfg.get("amp", True))
     submission_level = cfg.get("submission_level", "participant")
 
-    pids, sessions, preds = generate_submission_grouped(
+    result = generate_submission_grouped(
         grouped_model=grouped_model,
         task_head=task_head,
         loader=loader,
@@ -168,7 +187,12 @@ def main() -> None:
         a1_biases=None if a1_biases is None else a1_biases.to(device),
         decode_method=selected_decode_method,
         a2_threshold_offsets=None if a2_offsets is None else a2_offsets.to(device),
+        a1_head=a1_head,
     )
+    if args.task == "joint" and a1_head is not None:
+        pids, sessions, preds, a1_preds = result
+    else:
+        pids, sessions, preds = result
 
     manifest_df = pd.read_csv(manifest_path)
     file_ids = []
@@ -205,17 +229,28 @@ def main() -> None:
             file_ids.append(f"{school}_{cls}_{key[0]}_{key[1]}")
             filtered_preds.append(pred)
 
+    # Split file_id into school/class/pid
+    schools, classes, pids = [], [], []
+    for fid in file_ids:
+        parts = fid.split("_")
+        schools.append(f"{parts[0]}_{parts[1]}")
+        classes.append(f"{parts[2]}_{parts[3]}")
+        pids.append("_".join(parts[4:]))
+
     if args.task == "a1":
-        sub = pd.DataFrame(
-            {
-                "file_id": file_ids,
-                "p_D": [float(pred[0]) for pred in filtered_preds],
-                "p_A": [float(pred[1]) for pred in filtered_preds],
-                "p_S": [float(pred[2]) for pred in filtered_preds],
-            }
-        )
+        sub = pd.DataFrame({
+            "anon_school": schools,
+            "anon_class": classes,
+            "anon_pid": pids,
+            "p_D": [float(pred[0]) for pred in filtered_preds],
+            "p_A": [float(pred[1]) for pred in filtered_preds],
+            "p_S": [float(pred[2]) for pred in filtered_preds],
+        })
     else:
-        sub = pd.DataFrame({"file_id": file_ids})
+        sub = pd.DataFrame({
+            "anon_school": schools,
+            "anon_class": classes,
+        "anon_pid": pids})
         for idx, col in enumerate([f"d{i:02d}" for i in range(1, 22)]):
             sub[col] = [int(pred[idx]) for pred in filtered_preds]
 
@@ -223,6 +258,31 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sub.to_csv(output_path, index=False)
     print(output_path)
+
+    # A1 submission (joint mode)
+    if args.task == "joint" and a1_head is not None:
+        a1_schools, a1_classes, a1_pids = [], [], []
+        a1_filtered = []
+        if submission_level == "participant":
+            for pid, pred in zip(pids, a1_preds):
+                info = pid_to_info.get(str(pid))
+                if info is None: continue
+                school, cls = info
+                a1_schools.append(school)
+                a1_classes.append(cls)
+                a1_pids.append(str(pid))
+                a1_filtered.append(pred)
+        sub_a1 = pd.DataFrame({
+            "anon_school": a1_schools,
+            "anon_class": a1_classes,
+            "anon_pid": a1_pids,
+            "p_D": [float(p[0]) for p in a1_filtered],
+            "p_A": [float(p[1]) for p in a1_filtered],
+            "p_S": [float(p[2]) for p in a1_filtered],
+        })
+        a1_path = run_dir / "submissions" / f"submission_a1_{args.split}.csv"
+        sub_a1.to_csv(a1_path, index=False)
+        print(a1_path)
 
 
 if __name__ == "__main__":

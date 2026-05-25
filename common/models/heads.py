@@ -86,8 +86,17 @@ def a2_ordinal_loss(
     labels: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
+    gamma: float = 0.0,
 ) -> torch.Tensor:
     targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=logits.size(-1))
     if label_smoothing > 0.0:
         targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
-    return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    if gamma > 0.0:
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        bce = bce * (1 - pt) ** gamma
+    if pos_weight is not None:
+        pw = torch.where(targets == 1, pos_weight, 1.0)
+        bce = bce * pw
+    return bce.mean()

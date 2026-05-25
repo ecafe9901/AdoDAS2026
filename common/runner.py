@@ -21,7 +21,7 @@ from tqdm import tqdm
 import yaml
 
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
-from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
+from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn, build_length_bucketed_batches
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
 from .models.grouped_model import GroupedModel, CORALHead
@@ -47,7 +47,7 @@ class _RealtimeFileHandler(logging.FileHandler):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--task", type=str, required=True, choices=["a1", "a2"])
+    p.add_argument("--task", type=str, required=True, choices=["a1", "a2", "joint"])
     p.add_argument("--config", type=str, default="configs/default.yaml")
 
     p.add_argument("--feature_root", type=str, default=None)
@@ -101,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--use_pos_weight", type=int, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
+    p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
 
     return p.parse_args()
 
@@ -333,6 +334,10 @@ def train_one_epoch_grouped(
     best_metric: float = -1.0,
     label_smoothing: float = 0.0,
     feature_noise_std: float = 0.0,
+    a1_head: nn.Module | None = None,
+    a1_pos_weight: torch.Tensor | None = None,
+    a1_loss_weight: float = 0.3,
+    gamma: float = 0.0,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -364,7 +369,9 @@ def train_one_epoch_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            _llm = batch.get("llm_features")
+            out = grouped_model(flat_batch, B, session_valid,
+                                llm_features=_llm.to(device) if _llm is not None else None)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
@@ -372,18 +379,29 @@ def train_one_epoch_grouped(
             if task == "a1":
                 main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
             else:
-                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing, gamma=gamma)
 
             if has_valid_sessions:
                 s_logits = task_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
-                    sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
                 else:
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
-                    sess_loss = a2_ordinal_loss(
-                        s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing
-                    )
+
+                # Exclude A01 (neutral reading) from session auxiliary loss —
+                # it contains no clinical signal and forcing item predictions
+                # from reading-aloud content produces noisy gradients.
+                is_clinical = session_types[valid_session_mask] != 0  # A01=0
+                if is_clinical.any():
+                    if task == "a1":
+                        sess_loss = a1_loss(s_logits[is_clinical], s_targets[is_clinical],
+                                           pos_weight=pos_weight, label_smoothing=label_smoothing)
+                    else:
+                        sess_loss = a2_ordinal_loss(s_logits[is_clinical], s_targets[is_clinical],
+                                                    pos_weight=pos_weight, label_smoothing=label_smoothing,
+                                                    gamma=gamma)
+                else:
+                    sess_loss = p_logits.new_zeros(())
 
                 type_loss = F.cross_entropy(
                     out["session_type_logits"][valid_session_mask],
@@ -393,25 +411,49 @@ def train_one_epoch_grouped(
                 sess_loss = p_logits.new_zeros(())
                 type_loss = p_logits.new_zeros(())
 
+            # Joint A1 loss
+            a1_loss_val = p_logits.new_zeros(())
+            if a1_head is not None:
+                a1_logits = a1_head(out["participant_repr"])
+                a1_targets = batch["participant_y_a1"].to(device)
+                a1_loss_val = a1_loss(a1_logits, a1_targets,
+                                      pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
+
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+            if a1_head is not None:
+                loss = loss + a1_loss_weight * a1_loss_val
 
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if a1_head is not None:
+                _clip_params += list(a1_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
+            grads_finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for pg in optimizer.param_groups for p in pg["params"] if p.grad is not None
             )
-            scaler.step(optimizer)
+            if grads_finite:
+                scaler.step(optimizer)
+            else:
+                optimizer.zero_grad()
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if a1_head is not None:
+                _clip_params += list(a1_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
+            grads_finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for pg in optimizer.param_groups for p in pg["params"] if p.grad is not None
             )
-            optimizer.step()
+            if grads_finite:
+                optimizer.step()
+            else:
+                optimizer.zero_grad()
 
         total_loss += loss.item()
         n_batches += 1
@@ -433,6 +475,7 @@ def validate_grouped(
     use_amp: bool = False,
     pos_weight=None,
     decode_method: str = "expectation",
+    a1_head: nn.Module | None = None,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
@@ -444,6 +487,8 @@ def validate_grouped(
     all_labels = []
     all_logits = []
     all_sess_preds = []
+    all_a1_probs = []
+    all_a1_labels = []
 
     for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
         flat_batch = _to_device(batch["flat_batch"], device)
@@ -456,7 +501,9 @@ def validate_grouped(
             targets = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            _llm = batch.get("llm_features")
+            out = grouped_model(flat_batch, B, session_valid,
+                                llm_features=_llm.to(device) if _llm is not None else None)
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
@@ -464,6 +511,12 @@ def validate_grouped(
                 loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
 
             s_logits = task_head(out["session_reprs"])
+
+            # A1 (joint mode)
+            if a1_head is not None:
+                a1_probs = torch.sigmoid(a1_head(out["participant_repr"]).float()).cpu().numpy()
+                all_a1_probs.append(a1_probs)
+                all_a1_labels.append(batch["participant_y_a1"].cpu().numpy())
 
         if task == "a1":
             logits_np = p_logits.float().cpu().numpy()
@@ -573,9 +626,17 @@ def validate_grouped(
         bot3 = " ".join(f"d{r+1:02d}={item_qwk[r]:.3f}" for r in ranked[-3:])
         log.info(f"    top3: {top3}  |  bot3: {bot3}")
 
+        a1_f1 = 0.0
+        if all_a1_probs:
+            a1_probs = np.concatenate(all_a1_probs)
+            a1_labels_np = np.concatenate(all_a1_labels)
+            a1_f1 = binary_f1(a1_probs, a1_labels_np)
+            log.info(f"    A1 F1: {a1_f1:.4f}")
+
         return {
             "loss": avg_loss, "mean_qwk": mqwk, "mean_mae": mmae,
             "primary_metric": mqwk, "selected_decode_method": auto_selected_decode,
+            "a1_f1": a1_f1,
         }
 
 
@@ -593,9 +654,11 @@ def generate_submission_grouped(
     a1_biases: np.ndarray | None = None,
     decode_method: str = "expectation",
     a2_threshold_offsets: np.ndarray | None = None,
+    a1_head: nn.Module | None = None,
 ):
     grouped_model.eval()
     task_head.eval()
+    joint = (task == "joint" and a1_head is not None)
     decode_method = _normalize_decode_method(decode_method)
     if submission_level not in {"participant", "session"}:
         raise ValueError("submission_level must be 'participant' or 'session'")
@@ -603,6 +666,7 @@ def generate_submission_grouped(
     all_pids = []
     all_sessions = []
     all_preds = []
+    all_a1_preds = []
     a1_biases_t = None if a1_biases is None else torch.as_tensor(a1_biases, device=device, dtype=torch.float32)
     a2_offsets_t = (
         None if a2_threshold_offsets is None
@@ -615,7 +679,9 @@ def generate_submission_grouped(
         B = batch["n_participants"]
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            _llm = batch.get("llm_features")
+            out = grouped_model(flat_batch, B, session_valid,
+                                llm_features=_llm.to(device) if _llm is not None else None)
 
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
@@ -642,6 +708,17 @@ def generate_submission_grouped(
             all_sessions.extend(batch["flat_sessions"])
         all_preds.append(preds)
 
+        # A1 predictions (joint mode)
+        if joint and a1_head is not None:
+            a1_logits = a1_head(out["participant_repr"].float())
+            if a1_biases_t is not None:
+                a1_logits = a1_logits + a1_biases_t
+            a1_probs = torch.sigmoid(a1_logits).cpu().numpy()
+            all_a1_preds.append(a1_probs)
+
+    if joint:
+        return (all_pids, all_sessions, np.concatenate(all_preds),
+                np.concatenate(all_a1_preds))
     return all_pids, all_sessions, np.concatenate(all_preds)
 
 
@@ -658,7 +735,9 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            _llm = batch.get("llm_features")
+            out = grouped_model(flat_batch, B, session_valid,
+                                llm_features=_llm.to(device) if _llm is not None else None)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
@@ -685,7 +764,9 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            out = grouped_model(flat_batch, B, session_valid)
+            _llm = batch.get("llm_features")
+            out = grouped_model(flat_batch, B, session_valid,
+                                llm_features=_llm.to(device) if _llm is not None else None)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
@@ -792,6 +873,8 @@ def main() -> None:
         mask_policy=cfg.get("mask_policy", _defaults.mask_policy),
         core_audio=cfg.get("core_audio", _defaults.core_audio),
         core_video=cfg.get("core_video", _defaults.core_video),
+        use_llm_features=cfg.get("use_llm_features", _defaults.use_llm_features),
+        llm_feature_dir=cfg.get("llm_feature_dir", _defaults.llm_feature_dir),
     )
     log.info(f"Mask policy: {feat_cfg.mask_policy}")
 
@@ -817,10 +900,17 @@ def main() -> None:
 
     log.info(f"batch_size={batch_size}, num_workers={num_workers}")
 
+    log.info("Building length-bucketed batches (reduces padding waste 72% -> ~20%) ...")
+    train_batches = build_length_bucketed_batches(
+        train_ds, batch_size=batch_size, seed=cfg.get("seed", 42),
+    )
+    log.info(f"Train batches: {len(train_batches)} (avg {len(train_ds)/len(train_batches):.1f} participants/batch)")
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds,
+        batch_sampler=train_batches,
         num_workers=num_workers, collate_fn=grouped_collate_fn,
-        pin_memory=True, drop_last=True,
+        pin_memory=True,
         persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
@@ -834,6 +924,12 @@ def main() -> None:
     audio_group_dims = {n: dims[n] for n in feat_cfg.audio_sequence_features if n in dims}
     audio_pooled_group_dims = {n: dims[n] for n in feat_cfg.audio_pooled_features if n in dims}
     video_group_dims = {n: dims[n] for n in feat_cfg.video_features if n in dims}
+
+    d_llm = feat_cfg.llm_feature_dim if feat_cfg.use_llm_features else 0
+    llm_offset = 0
+    if task == "a2" and feat_cfg.use_llm_features:
+        llm_offset = 21  # skip DASS items, use only behavioral markers (13 dims)
+        d_llm = 13
 
     bb_cfg = BackboneConfig(
         audio_group_dims=audio_group_dims,
@@ -855,20 +951,29 @@ def main() -> None:
         d_shared=bb_cfg.d_shared,
         aggregator_method=cfg.get("aggregator", "mlp"),
         dropout=cfg.get("dropout", 0.2),
+        d_llm=d_llm,
+        llm_offset=llm_offset,
     ).to(device)
 
-    use_coral = bool(cfg.get("use_coral", False))
-    if task == "a1":
-        bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
-        task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
-    else:
-        if use_coral:
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
-            log.info("Using CORAL head for A2")
-        else:
-            task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
 
-    n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    joint = (task == "joint")
+    bias_init_a1 = _compute_bias_init_a1(manifest_dir / "train.csv")
+
+    a1_head = None
+    a1_pos_weight = None
+    if joint:
+        task_head = A2OrdinalHead(head_in_dim).to(device)
+        a1_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+        log.info("Joint A1+A2 training: A2 + A1")
+    elif task == "a1":
+        task_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+    else:
+        task_head = (CORALHead(head_in_dim) if bool(cfg.get("use_coral", False)) else A2OrdinalHead(head_in_dim)).to(device)
+
+    n_params = (sum(p.numel() for p in grouped_model.parameters()) +
+                sum(p.numel() for p in task_head.parameters()) +
+                (sum(p.numel() for p in a1_head.parameters()) if joint else 0))
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -878,16 +983,22 @@ def main() -> None:
 
     grad_clip = cfg.get("grad_clip", 1.0)
     pos_weight_t = None
+    a1_pos_weight = None
     if cfg.get("use_pos_weight", True):
-        if task == "a1":
+        if joint:
+            pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
+            pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
+            a1_pos_weight = torch.tensor(pw, dtype=torch.float32, device=device)
+            log.info(f"A2 pos_weight shape: {pos_weight_t.shape}, A1 pw [D/A/S]: {pw[0]:.2f}/{pw[1]:.2f}/{pw[2]:.2f}")
+        elif task == "a1":
             pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
-            log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
         else:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
-            log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     params = list(grouped_model.parameters()) + list(task_head.parameters())
+    if joint:
+        params += list(a1_head.parameters())
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -915,18 +1026,37 @@ def main() -> None:
     log.info(f"Feature noise std: {feature_noise_std}")
     log.info(f"Session drop prob: {session_drop_prob}")
 
+    start_epoch = 1
     best_metric = -1.0
+    if cfg.get("resume"):
+        ckpt_path = Path(cfg["resume"])
+        log.info(f"Resuming from {ckpt_path}")
+        state = load_checkpoint(ckpt_path, grouped_model, optimizer)
+        task_head.load_state_dict(state["head_state_dict"])
+        if a1_head is not None:
+            extra = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if "a1_head_state_dict" in extra:
+                a1_head.load_state_dict(extra["a1_head_state_dict"])
+                log.info("Loaded a1_head from checkpoint")
+            else:
+                log.info("a1_head not in checkpoint — training from scratch")
+        start_epoch = state["epoch"] + 1
+        best_metric = state.get("best_metric", -1.0)
+        log.info(f"Resumed from epoch {state['epoch']}, best_metric={best_metric:.4f}")
+
     metric_name = "F1" if task == "a1" else "QWK"
     t_start = time.time()
 
     log.info("=" * 90)
     if task == "a1":
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 raw | F1 sel |  AUROC | F1[D/A/S]       | Time")
+    elif joint:
+        log.info("  Epoch  |    LR     | Train Loss | Val Loss | QWK | MAE | A1 F1 | Time")
     else:
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | mean QWK | mean MAE | Time")
     log.info("=" * 90)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
         train_loss = train_one_epoch_grouped(
@@ -938,12 +1068,15 @@ def main() -> None:
             best_metric=best_metric,
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
+            a1_head=a1_head, a1_pos_weight=a1_pos_weight,
+            gamma=cfg.get("gamma", 0.0),
         )
 
         val_metrics = validate_grouped(
             grouped_model, task_head, val_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
             decode_method=cfg.get("decode_method", "expectation"),
+            a1_head=a1_head,
         )
         scheduler.step()
 
@@ -966,6 +1099,13 @@ def main() -> None:
                 f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
                 f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
             )
+        elif joint:
+            a1f1 = val_metrics.get("a1_f1", 0.0)
+            log.info(
+                f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                f" {val_metrics['mean_qwk']:.4f}  |  {val_metrics['mean_mae']:.4f}  | A1 {a1f1:.3f} | "
+                f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+            )
         else:
             log.info(
                 f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
@@ -975,11 +1115,14 @@ def main() -> None:
 
         if is_best:
             best_metric = primary
+            _extra = {"head_state_dict": task_head.state_dict()}
+            if a1_head is not None:
+                _extra["a1_head_state_dict"] = a1_head.state_dict()
             save_checkpoint(
                 run_dirs["checkpoints"] / "best.pt",
                 grouped_model, optimizer, epoch, best_metric,
-                extra={"head_state_dict": task_head.state_dict()},
-            )
+                extra=_extra,
+                )
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
 
@@ -1130,14 +1273,19 @@ def main() -> None:
                 num_workers=num_workers, collate_fn=grouped_collate_fn,
             )
 
-            pids, sessions, preds = generate_submission_grouped(
+            result = generate_submission_grouped(
                 grouped_model, task_head, loader, device, task, use_amp,
                 desc=f"Submit {split_name}",
                 submission_level=submission_level,
                 a1_biases=a1_biases,
                 decode_method=selected_decode_method,
                 a2_threshold_offsets=a2_offsets,
+                a1_head=a1_head,
             )
+            if joint and a1_head is not None:
+                pids, sessions, preds, a1_preds = result
+            else:
+                pids, sessions, preds = result
 
             manifest_df = pd.read_csv(manifest_path)
             file_ids = []
@@ -1185,22 +1333,42 @@ def main() -> None:
                     f"Submission row count mismatch for {split_name}: expected={expected_rows} generated={len(file_ids)}"
                 )
 
+            schools, classes, pids = [], [], []
+            for fid in file_ids:
+                parts = fid.split("_")
+                schools.append(f"{parts[0]}_{parts[1]}")
+                classes.append(f"{parts[2]}_{parts[3]}")
+                pids.append("_".join(parts[4:]))
+
             if task == "a1":
                 sub = pd.DataFrame({
-                    "file_id": file_ids,
-                    "p_D": preds[:, 0],
-                    "p_A": preds[:, 1],
-                    "p_S": preds[:, 2],
+                    "anon_school": schools, "anon_class": classes, "anon_pid": pids,
+                    "p_D": preds[:, 0], "p_A": preds[:, 1], "p_S": preds[:, 2],
                 })
             else:
                 item_cols = [f"d{i:02d}" for i in range(1, 22)]
-                sub = pd.DataFrame({"file_id": file_ids})
+                sub = pd.DataFrame({"anon_school": schools, "anon_class": classes, "anon_pid": pids})
                 for j, col in enumerate(item_cols):
                     sub[col] = preds[:, j]
 
             out_path = run_dirs["submissions"] / f"submission_{task}_{split_name}.csv"
             sub.to_csv(out_path, index=False)
             log.info(f"Wrote {len(sub)} rows to {out_path}")
+
+            # A1 submission for joint mode
+            if joint and "a1_preds" in dir() and len(a1_preds) > 0:
+                a1_filtered = [a1_preds[i] for i in range(len(a1_preds))
+                               if file_ids[i] in set(file_ids)]
+                if len(a1_filtered) == len(file_ids):
+                    sub_a1 = pd.DataFrame({
+                        "anon_school": schools, "anon_class": classes, "anon_pid": pids,
+                        "p_D": np.asarray(a1_filtered)[:, 0],
+                        "p_A": np.asarray(a1_filtered)[:, 1],
+                        "p_S": np.asarray(a1_filtered)[:, 2],
+                    })
+                    a1_path = run_dirs["submissions"] / f"submission_a1_{split_name}.csv"
+                    sub_a1.to_csv(a1_path, index=False)
+                    log.info(f"Wrote {len(sub_a1)} rows to {a1_path}")
     else:
         log.info("Skipping submission generation after training; use infer.py for release inference.")
 

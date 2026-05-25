@@ -74,31 +74,52 @@ class GroupedModel(nn.Module):
         d_shared: int,
         aggregator_method: str = "mlp",
         dropout: float = 0.2,
+        d_llm: int = 0,
+        llm_offset: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
+        self.d_llm = d_llm
+        self.llm_offset = llm_offset
         self.aggregator = ParticipantAggregator(
             d_in=d_shared, d_out=d_shared,
             method=aggregator_method, dropout=dropout,
         )
-        self.session_type_head = SessionTypeClassifier(d_in=d_shared)
+        self.session_type_head = SessionTypeClassifier(d_in=d_shared + (64 if d_llm > 0 else 0))
+        if d_llm > 0:
+            self.llm_proj = nn.Sequential(
+                nn.Linear(d_llm, 64),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 64),
+            )
+        else:
+            self.llm_proj = None
 
     def forward(
         self,
         flat_batch: dict,
         n_participants: int,
         session_valid: torch.Tensor,
+        llm_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
 
-        session_reprs = self.backbone(flat_batch) 
+        session_reprs = self.backbone(flat_batch)
 
         B = n_participants
         session_grid = session_reprs.view(B, 4, -1)
 
+        participant_repr = self.aggregator(session_grid, session_valid)
 
-        participant_repr = self.aggregator(session_grid, session_valid) 
+        # Fuse LLM features at participant level
+        if self.llm_proj is not None and llm_features is not None:
+            sliced = llm_features[:, self.llm_offset:self.llm_offset + self.d_llm]
+            llm_emb = self.llm_proj(sliced.to(participant_repr.dtype))
+            participant_repr = torch.cat([participant_repr, llm_emb], dim=-1)
+            # Pad session reprs to same dim so single task_head works for both
+            session_reprs = F.pad(session_reprs, (0, 64))
 
-        session_type_logits = self.session_type_head(session_reprs) 
+        session_type_logits = self.session_type_head(session_reprs)
 
         return {
             "session_reprs": session_reprs,

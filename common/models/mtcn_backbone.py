@@ -178,7 +178,7 @@ class MTCNBackbone(nn.Module):
         self.audio_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
         self.video_asp = ASP(cfg.d_model, cfg.asp_alpha, cfg.asp_beta)
 
-        fusion_in = 2 * cfg.d_model * 2  
+        fusion_in = 2 * cfg.d_model * 2
         fusion_in += len(self.audio_pooled_group_names) * cfg.d_adapter
         fusion_in += cfg.d_session 
 
