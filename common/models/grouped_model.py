@@ -100,6 +100,7 @@ class GroupedModel(nn.Module):
             self.llm_proj = None
         if n_schools > 0:
             self.school_emb = nn.Embedding(n_schools, d_school_emb)
+            self.school_proj = nn.Linear(d_school_emb, d_shared)
         else:
             self.school_emb = None
 
@@ -129,11 +130,11 @@ class GroupedModel(nn.Module):
 
         session_type_logits = self.session_type_head(session_reprs)
 
-        # Fuse school embedding at participant level (after session_type_head so
-        # school info doesn't leak into session-level predictions)
+        # Apply school embedding as additive bias (not concat — prevents shortcut)
         if self.school_emb is not None and school_idx is not None:
             s_emb = self.school_emb(school_idx)
-            participant_repr = torch.cat([participant_repr, s_emb], dim=-1)
+            school_bias = self.school_proj(s_emb)
+            participant_repr = participant_repr + school_bias
 
         return {
             "session_reprs": session_reprs,

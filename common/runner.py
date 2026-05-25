@@ -385,12 +385,7 @@ def train_one_epoch_grouped(
                 main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing, gamma=gamma)
 
             if has_valid_sessions:
-                # Pad session_reprs if participant_repr has extra dims (school/LLM emb)
-                s_repr = out["session_reprs"]
-                p_dim = out["participant_repr"].shape[-1]
-                if s_repr.shape[-1] < p_dim:
-                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
-                s_logits = task_head(s_repr)[valid_session_mask]
+                s_logits = task_head(out["session_reprs"])[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
                 else:
@@ -523,11 +518,7 @@ def validate_grouped(
             else:
                 loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
 
-            s_repr = out["session_reprs"]
-            p_dim = out["participant_repr"].shape[-1]
-            if s_repr.shape[-1] < p_dim:
-                s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
-            s_logits = task_head(s_repr)
+            s_logits = task_head(out["session_reprs"])
 
             # A1 (joint mode)
             if a1_head is not None:
@@ -729,11 +720,7 @@ def generate_submission_grouped(
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
             else:
-                s_repr = out["session_reprs"]
-                p_dim = out["participant_repr"].shape[-1]
-                if s_repr.shape[-1] < p_dim:
-                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
-                logits = task_head(s_repr)
+                logits = task_head(out["session_reprs"])
 
         if task == "a1":
             logits_f = logits.float()
@@ -792,11 +779,7 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
                 labels = batch["participant_y_a1"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                s_repr = out["session_reprs"]
-                p_dim = out["participant_repr"].shape[-1]
-                if s_repr.shape[-1] < p_dim:
-                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
-                logits = task_head(s_repr).float().cpu().numpy()[valid_session_mask]
+                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a1"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -827,11 +810,7 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
                 labels = batch["participant_y_a2"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                s_repr = out["session_reprs"]
-                p_dim = out["participant_repr"].shape[-1]
-                if s_repr.shape[-1] < p_dim:
-                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
-                logits = task_head(s_repr).float().cpu().numpy()[valid_session_mask]
+                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a2"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -1015,7 +994,7 @@ def main() -> None:
         n_schools=10,
     ).to(device)
 
-    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0) + 16  # +16 for school emb
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
 
     joint = (task == "joint")
     bias_init_a1 = _compute_bias_init_a1(manifest_dir / "train.csv")

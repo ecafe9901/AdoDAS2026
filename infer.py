@@ -152,7 +152,7 @@ def main() -> None:
         n_schools=10,
     ).to(device)
 
-    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0) + 16  # +16 for school emb
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
     if args.task == "a1":
         task_head = A1Head(head_in_dim).to(device)
     elif args.task == "joint":
