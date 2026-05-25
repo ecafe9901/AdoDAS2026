@@ -290,7 +290,7 @@ def _compute_pos_weight_a1(manifest_path: Path) -> list[float]:
         n_pos = df[col].sum()
         n_neg = len(df) - n_pos
         w = float(np.sqrt(n_neg / max(n_pos, 1)))
-        w = max(1.0, min(w, 4.0))
+        w = max(1.0, min(w, 2.0))
         weights.append(w)
     return weights
 
@@ -309,11 +309,12 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
     df = pd.read_csv(manifest_path)
     item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
     pw = np.ones((n_items, n_thresholds), dtype=np.float32)
+    max_clip = {0: 1.0, 1: 2.0, 2: 3.0}  # gentle push for rare thresholds only
     for j, col in enumerate(item_cols):
         vals = df[col].values.astype(int)
         for k in range(n_thresholds):
             p = max(np.mean(vals >= (k + 1)), 1e-6)
-            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 10.0)
+            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, max_clip[k])
     return torch.from_numpy(pw).unsqueeze(0)
 
 def train_one_epoch_grouped(
@@ -848,8 +849,8 @@ def main() -> None:
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    output_root = Path(cfg.get("output_dir", "/media/k3nwong/Data1/test/train/output"))
-    manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
+    output_root = Path(cfg.get("output_dir", "/mnt/data/datasets/AdoDAS/output/train"))
+    manifest_dir = Path(cfg.get("manifest_dir", "/mnt/data/datasets/AdoDAS/manifests"))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")

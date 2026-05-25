@@ -25,7 +25,7 @@ POOLED_AUDIO_FEATURES = {"egemaps"}
 
 @dataclass
 class FeatureConfig:
-    feature_root: str = "/media/k3nwong/Data1/test/outputs/pipeline/anonymized"
+    feature_root: str = "/mnt/data/datasets/AdoDAS/Train"
     audio_features: list[str] = field(
         default_factory=lambda: ["mel_mfcc", "vad", "egemaps", "ssl_embed"]
     )
