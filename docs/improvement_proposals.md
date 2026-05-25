@@ -115,7 +115,17 @@ def compute_a2_pos_weight_per_school(manifest_path):
 
 ---
 
-## Phase 3: Training Stability (validated, ongoing)
+## Phase 3: Feature Selection (validated findings)
+
+### 3.0 body_pose + global_motion — Disable for A2
+
+**Finding**: These 2 video features (72 extra dims) add ~2 GB VRAM and dilute A2 signal. A2 QWK with them enabled plateaued at 0.04 vs 0.20 without. Keep disabled for A2. For A1, not yet tested in isolation.
+
+**Status**: Verified harmful. Should remain disabled in A2 config.
+
+---
+
+## Phase 4: Training Stability (validated, ongoing)
 
 ### 3.1 Gentle pos_weight for A2
 
@@ -151,7 +161,23 @@ Let the model learn the 0↔1 boundary freely. Only nudge score≥2 and score≥
 
 ## Phase 4: Efficiency (deferred)
 
-### 4.1 SCH_003 Downsampling
+### 4.1 Emotional State Stratification
+
+**File**: `common/data/grouped_dataset.py` — batch sampler
+
+Use the Emotional state change column (State=2 has 4× higher DASS scores) for stratified batch sampling. Ensures each batch has proportional representation from State=1/2/3 (40%/19%/41%).
+
+```python
+# Stratify by emotional state during batch building
+state_groups = {1: [], 2: [], 3: []}
+for p in participants:
+    state_groups[p["emotional_state"]].append(p)
+# Sample proportionally from each group per batch
+```
+
+**Cost**: ~15 lines. **Benefit**: Prevents model from overfitting to low-score participants (State=1/3, 80% of data) and never seeing high-score State=2 cases. Particularly valuable for A1 where Stress=12.9% positive rate.
+
+### 4.2 SCH_003 Downsampling
 
 SCH_003 has 433 participants with 91.8% zeros — almost no learning signal. Randomly downsample to reduce I/O.
 
@@ -184,9 +210,11 @@ Prevents the model from becoming overly confident on negative predictions. Helps
 | 2.1 | Exclude A01 from session loss | Not started (rolled back) | ~8 | Data fix |
 | 2.2 | School-aware embedding | Not started | ~30 | Data fix |
 | 2.3 | School-aware pos_weight | Not started | ~20 | Data fix |
+| 3.0 | body_pose+global_motion disabled A2 | ✅ Verified harmful | — | Feature |
 | 3.1 | Gentle A2 pos_weight | ✅ Implemented | — | Stability |
-| 3.2 | Gentle A1 pos_weight | ✅ Implemented | — | Stability |
+| 3.2 | Gentle A1 pos_weight (max clip 2.0) | ✅ Implemented | — | Stability |
 | 3.3 | NaN gradient guard | ✅ Implemented | — | Stability |
 | 3.4 | A2 use_pos_weight=false | ✅ Applied | — | Stability |
-| 4.1 | SCH_003 downsampling | Deferred | ~10 | Efficiency |
-| 4.2 | A1 label_smoothing | Deferred | 1 | Efficiency |
+| 4.1 | Emotional state stratification | Not started | ~15 | Data fix |
+| 4.2 | SCH_003 downsampling | Deferred | ~10 | Efficiency |
+| 4.3 | A1 label_smoothing | Deferred | 1 | Efficiency |

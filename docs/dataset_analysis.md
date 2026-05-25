@@ -144,7 +144,54 @@ Items are moderately correlated (r=0.25–0.73). d17↔d21 strongest (r=0.73). d
 
 ---
 
-## 9. School and Class as Wasted Training Data
+## 10. Emotional State Change — Strong Non-Linear Signal (Hidden from Test)
+
+The manifest CSV files contain 5 extra questionnaire columns beyond the DASS labels:
+
+| Column | Values | Coverage |
+|---|---|---|
+| Family structure | 1-6 | 98.6% |
+| Only child status | 0/1 | 100% |
+| Parental favoritism | 1-3 | 65.1% |
+| Academic performance change | 1-3 | 100% |
+| Emotional state change | 1-3 | 100% |
+
+None of these columns exist in the test set manifest.
+
+### Emotional State Change — U-Shaped, 4× Score Difference
+
+| State | Participants | A2 Sum Mean | %≥1 | %≥2 | Depression | Anxiety | Stress |
+|---|---|---|---|---|---|---|---|
+| 1 | 1,684 (40%) | 4.79 | 18.3% | 3.3% | 9.9% | 16.3% | 5.2% |
+| **2** | **809 (19%)** | **19.19** | **63.5%** | **20.6%** | **58.7%** | **65.6%** | **40.7%** |
+| 3 | 1,707 (41%) | 6.41 | 24.9% | 4.4% | 15.5% | 22.3% | 7.3% |
+
+**ANOVA F=765.25, p=0.0000**. State=2 participants have 4× higher DASS scores than State=1. All 21 items are individually significant (p<0.0001). The relationship is U-shaped (State=1 low, State=2 high, State=3 low), which explains why simple Pearson r=0.068 missed it — correlation assumes linearity.
+
+### Random Forest: R²=0.286 (Emotional state = 83% of feature importance)
+
+A non-linear model using all 5 columns achieves R²=0.286 for predicting A2 sum score. Emotional state change alone dominates at 83% importance.
+
+### Practical Use — Stratified Sampling
+
+Since these columns are absent from test data, they cannot be used as features. But Emotional state change can guide **stratified batch sampling**: ensure each training batch has proportional representation from State=1/2/3. Prevents the model from overfitting to State=1/3 (80% of participants) while never encountering high-score State=2 cases.
+
+---
+
+## 11. body_pose + global_motion — Harmful for A2
+
+These 2 video features (72 extra dimensions) were tested after re-enabling them from the upstream config:
+
+| Run | QWK at Epoch 6-8 | Trend |
+|---|---|---|
+| Without body_pose/global_motion | 0.063→0.204 (peak) | Climbing |
+| With body_pose/global_motion | 0.044 (plateaued) | Stuck |
+
+The extra 72 feature dimensions increase VRAM usage (~2 GB) and appear to dilute the signal-to-noise ratio. For A2, these features should remain disabled. For A1, they may still have value (not yet tested in isolation).
+
+---
+
+## 9. School and Class as Wasted Training Data (continued)
 
 SCH_003 contributes 433 participants (10.3% of training data) with 91.8% zeros. Within SCH_003, CLS_0140 has 20 students — all with mean score 0.000. These participants provide zero learning signal but consume ~35 GB of I/O per epoch.
 
