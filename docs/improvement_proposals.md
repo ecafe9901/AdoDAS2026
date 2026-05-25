@@ -73,28 +73,32 @@ else:
 
 **Cost**: ~8 lines. **Benefit**: Removes impossible prediction targets from loss. Validated in V2 — needs re-application after rollback.
 
-### 2.2 School-Aware Embedding
+### 2.2 School-Aware Embedding (concatenation — IMPLEMENTED, VERIFIED HARMFUL)
 
-**Files**: `common/models/grouped_model.py`, `common/data/grouped_dataset.py`, `common/runner.py`
+**Status**: Implemented and tested. **Finding**: Concatenation enables the model to cheat — it learns to use school identity as a lookup table, ignoring clinical features. Per-school QWK collapsed to 0.000 for 8/10 schools. Global QWK inflated (0.214) from school-level baseline shifts.
 
-Add a learnable school embedding (10 schools × 16-dim) to the participant representation. Lets the model learn site-specific baselines while keeping the clinical backbone site-agnostic.
+**Evidence**:
+- With school embedding (concat): per-school QWK all zero except SCH_003=0.190
+- Without school embedding: per-school QWK varies from -0.013 to 0.166 across schools
+- Global QWK dropped when using concatenation because model stopped learning clinical features
+
+**Fix needed**: Change from concatenation to **additive bias**:
 
 ```python
 # grouped_model.py
-self.school_emb = nn.Embedding(10, 16)
+self.school_emb = nn.Embedding(10, 4)  # reduced from 16
+self.school_proj = nn.Linear(4, d_shared)  # project to backbone dim
 
 # forward():
-school_bias = self.school_emb(school_idx)
-participant_repr = torch.cat([participant_repr, school_bias], dim=-1)
+school_bias = self.school_proj(self.school_emb(school_idx))
+participant_repr = participant_repr + school_bias  # ADD, not concat
 ```
 
-```python
-# grouped_dataset.py — add school_idx to participant dict
-SCHOOL_TO_IDX = {f"SCH_{i:03d}": i for i in range(1, 11)}
-info["school_idx"] = SCHOOL_TO_IDX.get(str(info["anon_school"]), 0)
-```
+- Addition forces the backbone to carry clinical signal; school embedding only provides a mild per-school shift
+- Head dim returns to d_shared (no extra dims needed)
+- d_school_emb: 16→4 to limit capacity for cheating
 
-**Cost**: ~30 lines. **Benefit**: Explicitly models school effects rather than learning them implicitly. Class effects are nested within schools — the school embedding captures most class-level variance. Adding per-class embeddings (249 classes) would overfit — not recommended.
+**Cost**: ~30 lines (already implemented, ~10 lines to fix). **Benefit**: Per-school QWK should recover to >0.00 for all schools. Global QWK may dip initially but should recover to 0.18-0.22 with genuine clinical signal.
 
 ### 2.3 School-Aware pos_weight
 
@@ -207,9 +211,10 @@ Prevents the model from becoming overly confident on negative predictions. Helps
 | 1.1 | Per-school validation QWK | ✅ Implemented | ~15 | Monitoring |
 | 1.2 | Per-class validation QWK | Not started | ~10 | Monitoring |
 | 1.3 | Per-item QWK tracking | ✅ Implemented | ~5 | Monitoring |
-| 2.1 | Exclude A01 from session loss | Not started (rolled back) | ~8 | Data fix |
-| 2.2 | School-aware embedding | Not started | ~30 | Data fix |
-| 2.3 | School-aware pos_weight | Not started | ~20 | Data fix |
+| 2.1 | Exclude A01 from session loss | ✅ In code (from V2) | ~8 | Data fix |
+| 2.2a | School embedding (concat) | ✅ Built, **verify harmful** | ~30 | Data fix |
+| 2.2b | School embedding (additive bias fix) | 🔜 Next | ~10 | Data fix |
+| 2.3 | School-aware pos_weight (A1 only) | Not started | ~20 | Data fix |
 | 3.0 | body_pose+global_motion disabled A2 | ✅ Verified harmful | — | Feature |
 | 3.1 | Gentle A2 pos_weight | ✅ Implemented | — | Stability |
 | 3.2 | Gentle A1 pos_weight (max clip 2.0) | ✅ Implemented | — | Stability |
