@@ -488,6 +488,7 @@ def validate_grouped(
     all_labels = []
     all_logits = []
     all_sess_preds = []
+    all_schools = []
     all_a1_probs = []
     all_a1_labels = []
 
@@ -500,6 +501,8 @@ def validate_grouped(
             targets = batch["participant_y_a1"].to(device)
         else:
             targets = batch["participant_y_a2"].to(device).long()
+
+        all_schools.extend(batch.get("anon_schools", []))
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
@@ -578,6 +581,18 @@ def validate_grouped(
                 sess_var = np.mean(np.var(sess_grid, axis=1))
                 log.info(f"    Session-level variance (collapse metric): {sess_var:.6f}")
 
+        # Per-school calibrated F1
+        if all_schools:
+            school_arr = np.array(all_schools)
+            cal_f1s = []
+            for sch in sorted(set(school_arr)):
+                mask = school_arr == sch
+                if mask.sum() >= 5:
+                    f1_sch = binary_f1(cal_probs_np[mask], labels_np[mask], threshold=0.5)
+                    cal_f1s.append(f"{sch}={f1_sch:.3f}")
+            if cal_f1s:
+                log.info(f"    per-school cal F1: {' '.join(cal_f1s)}")
+
         log.info(
             f"    calibrated F1={cal_mf1:.4f} via biases "
             f"D={cal_biases[0]:+.2f} A={cal_biases[1]:+.2f} S={cal_biases[2]:+.2f} "
@@ -627,6 +642,18 @@ def validate_grouped(
         bot3 = " ".join(f"d{r+1:02d}={item_qwk[r]:.3f}" for r in ranked[-3:])
         log.info(f"    top3: {top3}  |  bot3: {bot3}")
 
+        # Per-school QWK
+        if all_schools:
+            school_arr = np.array(all_schools)
+            school_qwks = {}
+            for sch in sorted(set(school_arr)):
+                mask = school_arr == sch
+                if mask.sum() >= 5:
+                    school_qwks[sch] = mean_qwk(preds_np[mask], labels_np[mask])
+            if school_qwks:
+                parts = " ".join(f"{s}={v:.3f}" for s, v in sorted(school_qwks.items()))
+                log.info(f"    per-school QWK: {parts}")
+
         a1_f1 = 0.0
         if all_a1_probs:
             a1_probs = np.concatenate(all_a1_probs)
@@ -637,7 +664,7 @@ def validate_grouped(
         return {
             "loss": avg_loss, "mean_qwk": mqwk, "mean_mae": mmae,
             "primary_metric": mqwk, "selected_decode_method": auto_selected_decode,
-            "a1_f1": a1_f1,
+            "a1_f1": a1_f1, "per_item_qwk": item_qwk.tolist(),
         }
 
 
