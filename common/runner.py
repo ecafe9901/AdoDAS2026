@@ -664,7 +664,7 @@ def validate_grouped(
         return {
             "loss": avg_loss, "mean_qwk": mqwk, "mean_mae": mmae,
             "primary_metric": mqwk, "selected_decode_method": auto_selected_decode,
-            "a1_f1": a1_f1, "per_item_qwk": item_qwk.tolist(),
+            "a1_f1": a1_f1, "per_item_qwk": list(item_qwk),
         }
 
 
