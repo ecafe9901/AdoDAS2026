@@ -77,7 +77,44 @@ Test set has more high-score participants than training proportion would predict
 
 ---
 
-## 4. Item Difficulty Variation — up to 4×
+## 4. Class-Level Distribution Shift — Worse than Schools
+
+### Class Size Variation
+
+The 249 classes (mean 17 students, range 1–41) have extreme internal variation — classes of 1–3 students have zero statistical reliability.
+
+### Within-School Class Variation — up to 4×
+
+| School | Classes | Min mean | Max mean | Range | CV |
+|---|---|---|---|---|---|
+| SCH_003 | 31 | 0.000 | 0.362 | 0.362 | 0.77 |
+| SCH_005 | 34 | 0.345 | 1.429 | 1.083 | 0.34 |
+| SCH_008 | 29 | 0.000 | 0.388 | 0.388 | 0.74 |
+| SCH_010 | 41 | 0.000 | 1.000 | 1.000 | 0.44 |
+
+SCH_005 has a 4× difference in mean score between its lowest and highest classes (0.345 → 1.429). Some classes within the same school are systematically different — potentially different recording setups, labeling practices, or demographics.
+
+### Extreme Class Outliers
+
+| School/Class | Students | Mean Score | %≥2 | Issue |
+|---|---|---|---|---|
+| SCH_003/CLS_0140 | 20 | 0.000 | 0% | All zeros — wasted data |
+| SCH_005/CLS_0107 | 24 | 1.014 | 23% | 50% above school mean |
+| SCH_005/CLS_0233 | 6 | 1.357 | 40% | 2× school mean |
+| SCH_005/CLS_0148 | 28 | 0.345 | — | Half of school mean |
+| SCH_001/CLS_0024 | 12 | 1.099 | 31% | 2× school mean |
+
+### Class Overlap Across Splits
+
+203/249 classes shared across all 3 splits. 6 train-only, 0 val-only, 1 test-only. Good overlap — class-level distribution shift is less about missing classes and more about internal score variation.
+
+### Implication
+
+The "school effect" is partially driven by class-level clustering. If a batch contains 8/12 participants from one high-scoring class (SCH_005/CLS_0107), the model may learn class-specific recording conditions rather than clinical signals. School embeddings capture most of this variance, but extreme class outliers can bias per-batch gradients.
+
+---
+
+## 5. Item Difficulty Variation — up to 4×
 
 | Item | % zeros | Entropy | Difficulty |
 |---|---|---|---|
@@ -89,24 +126,28 @@ Easy items have 3-4× more signal than hard items. A shared CORAL head treats al
 
 ---
 
-## 5. A01 Label Contamination
+## 6. A01 Label Contamination
 
 A01 (neutral reading passage) has the same clinical labels (y_D, y_A, y_S, d01–d21) as B01/B02/B03. The model is forced to predict depression scores from reading aloud — an impossible task. This injects noise into the session auxiliary loss.
 
 ---
 
-## 6. Session Representation Collapse
+## 7. Session Representation Collapse
 
 Session variance (A1): 0.001→0.010 — model produces nearly identical representations for all 4 sessions. `session_loss_weight=0.2` in A1 is too low to encourage session differentiation. In A2, `session_loss_weight=0.5` produces healthier session variance.
 
 ---
 
-## 7. Per-Item Correlation
+## 8. Per-Item Correlation
 
 Items are moderately correlated (r=0.25–0.73). d17↔d21 strongest (r=0.73). d14↔d21 weakest (r=0.25). The latent DASS structure exists but is not redundant — items carry complementary signals.
 
 ---
 
-## 8. School as Wasted Training Data
+## 9. School and Class as Wasted Training Data
 
-SCH_003 contributes 433 participants (10.3% of training data) with 91.8% zeros. These participants provide almost no learning signal but consume ~35 GB of I/O per epoch. SCH_006 and SCH_008 are similarly sparse (80%+ zeros).
+SCH_003 contributes 433 participants (10.3% of training data) with 91.8% zeros. Within SCH_003, CLS_0140 has 20 students — all with mean score 0.000. These participants provide zero learning signal but consume ~35 GB of I/O per epoch.
+
+SCH_005 has the opposite problem — some classes (CLS_0107, CLS_0233) score 2-4× above the school mean. The model receives inconsistent signals from the same school: half the classes suggest "high scoring school," half suggest "moderate."
+
+Total wasted I/O: SCH_003 (10.3%) + sparse classes in SCH_006/SCH_008 (80%+ zeros) ≈ 20% of training data contributes near-zero gradient signal.

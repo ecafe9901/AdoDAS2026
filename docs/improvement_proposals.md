@@ -23,7 +23,24 @@ log.info(f"  Per-school QWK: " + " ".join(f"{s}={v:.3f}" for s, v in sorted(scho
 
 **Cost**: ~15 lines. **Benefit**: Answers "does QWK vary by school?"
 
-### 1.2 Per-Item QWK Trend Tracking
+### 1.2 Per-Class Validation QWK
+
+**File**: `common/runner.py`, `common/data/grouped_dataset.py`
+
+Extend school monitoring to class level. Add `anon_classes` to batch output (collate function already has the data), then log per-class QWK.
+
+```python
+# grouped_dataset.py — grouped_collate_fn
+"anon_classes": [b["anon_class"] for b in batch],
+
+# runner.py — validate_grouped
+all_classes.extend(batch.get("anon_classes", []))
+# After validation loop — same as school pattern
+```
+
+**Cost**: ~10 lines. **Benefit**: Detects if specific classes (e.g., SCH_005/CLS_0107 with 1.014 mean) are driving validation metrics.
+
+### 1.3 Per-Item QWK Trend Tracking
 
 **File**: `common/utils/run_metadata.py`
 
@@ -77,7 +94,7 @@ SCHOOL_TO_IDX = {f"SCH_{i:03d}": i for i in range(1, 11)}
 info["school_idx"] = SCHOOL_TO_IDX.get(str(info["anon_school"]), 0)
 ```
 
-**Cost**: ~30 lines. **Benefit**: Explicitly models school effects rather than learning them implicitly.
+**Cost**: ~30 lines. **Benefit**: Explicitly models school effects rather than learning them implicitly. Class effects are nested within schools — the school embedding captures most class-level variance. Adding per-class embeddings (249 classes) would overfit — not recommended.
 
 ### 2.3 School-Aware pos_weight
 
@@ -161,8 +178,9 @@ Prevents the model from becoming overly confident on negative predictions. Helps
 
 | # | Item | Status | Lines | Phase |
 |---|---|---|---|---|
-| 1.1 | Per-school validation QWK | Not started | ~15 | Monitoring |
-| 1.2 | Per-item QWK tracking | Not started | ~5 | Monitoring |
+| 1.1 | Per-school validation QWK | ✅ Implemented | ~15 | Monitoring |
+| 1.2 | Per-class validation QWK | Not started | ~10 | Monitoring |
+| 1.3 | Per-item QWK tracking | ✅ Implemented | ~5 | Monitoring |
 | 2.1 | Exclude A01 from session loss | Not started (rolled back) | ~8 | Data fix |
 | 2.2 | School-aware embedding | Not started | ~30 | Data fix |
 | 2.3 | School-aware pos_weight | Not started | ~20 | Data fix |
