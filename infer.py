@@ -172,6 +172,8 @@ def main() -> None:
     task_head.eval()
 
     a1_biases, a2_offsets, selected_decode_method = load_calibration(run_dir, args.task)
+    if args.task == "a1":
+        selected_decode_method = "expectation"  # A1 doesn't use decode_method; cal returns submission_level
     use_amp = bool(cfg.get("amp", True))
     submission_level = cfg.get("submission_level", "participant")
 
