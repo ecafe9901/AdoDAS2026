@@ -371,8 +371,10 @@ def train_one_epoch_grouped(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
+            school_idx = batch.get("school_idx", torch.zeros(B, dtype=torch.long)).to(device)
             out = grouped_model(flat_batch, B, session_valid,
-                                llm_features=_llm.to(device) if _llm is not None else None)
+                                llm_features=_llm.to(device) if _llm is not None else None,
+                                school_idx=school_idx)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
@@ -383,7 +385,12 @@ def train_one_epoch_grouped(
                 main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing, gamma=gamma)
 
             if has_valid_sessions:
-                s_logits = task_head(out["session_reprs"])[valid_session_mask]
+                # Pad session_reprs if participant_repr has extra dims (school/LLM emb)
+                s_repr = out["session_reprs"]
+                p_dim = out["participant_repr"].shape[-1]
+                if s_repr.shape[-1] < p_dim:
+                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
+                s_logits = task_head(s_repr)[valid_session_mask]
                 if task == "a1":
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
                 else:
@@ -506,15 +513,21 @@ def validate_grouped(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
+            school_idx = batch.get("school_idx", torch.zeros(B, dtype=torch.long)).to(device)
             out = grouped_model(flat_batch, B, session_valid,
-                                llm_features=_llm.to(device) if _llm is not None else None)
+                                llm_features=_llm.to(device) if _llm is not None else None,
+                                school_idx=school_idx)
             p_logits = task_head(out["participant_repr"])
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
             else:
                 loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
 
-            s_logits = task_head(out["session_reprs"])
+            s_repr = out["session_reprs"]
+            p_dim = out["participant_repr"].shape[-1]
+            if s_repr.shape[-1] < p_dim:
+                s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
+            s_logits = task_head(s_repr)
 
             # A1 (joint mode)
             if a1_head is not None:
@@ -708,13 +721,19 @@ def generate_submission_grouped(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
+            school_idx = batch.get("school_idx", torch.zeros(B, dtype=torch.long)).to(device)
             out = grouped_model(flat_batch, B, session_valid,
-                                llm_features=_llm.to(device) if _llm is not None else None)
+                                llm_features=_llm.to(device) if _llm is not None else None,
+                                school_idx=school_idx)
 
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"])
             else:
-                logits = task_head(out["session_reprs"])
+                s_repr = out["session_reprs"]
+                p_dim = out["participant_repr"].shape[-1]
+                if s_repr.shape[-1] < p_dim:
+                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
+                logits = task_head(s_repr)
 
         if task == "a1":
             logits_f = logits.float()
@@ -764,14 +783,20 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
+            school_idx = batch.get("school_idx", torch.zeros(B, dtype=torch.long)).to(device)
             out = grouped_model(flat_batch, B, session_valid,
-                                llm_features=_llm.to(device) if _llm is not None else None)
+                                llm_features=_llm.to(device) if _llm is not None else None,
+                                school_idx=school_idx)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                s_repr = out["session_reprs"]
+                p_dim = out["participant_repr"].shape[-1]
+                if s_repr.shape[-1] < p_dim:
+                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
+                logits = task_head(s_repr).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a1"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -793,14 +818,20 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             _llm = batch.get("llm_features")
+            school_idx = batch.get("school_idx", torch.zeros(B, dtype=torch.long)).to(device)
             out = grouped_model(flat_batch, B, session_valid,
-                                llm_features=_llm.to(device) if _llm is not None else None)
+                                llm_features=_llm.to(device) if _llm is not None else None,
+                                school_idx=school_idx)
             if submission_level == "participant":
                 logits = task_head(out["participant_repr"]).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                s_repr = out["session_reprs"]
+                p_dim = out["participant_repr"].shape[-1]
+                if s_repr.shape[-1] < p_dim:
+                    s_repr = F.pad(s_repr, (0, p_dim - s_repr.shape[-1]))
+                logits = task_head(s_repr).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a2"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -981,9 +1012,10 @@ def main() -> None:
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
         llm_offset=llm_offset,
+        n_schools=10,
     ).to(device)
 
-    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0) + 16  # +16 for school emb
 
     joint = (task == "joint")
     bias_init_a1 = _compute_bias_init_a1(manifest_dir / "train.csv")

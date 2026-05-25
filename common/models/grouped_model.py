@@ -76,11 +76,14 @@ class GroupedModel(nn.Module):
         dropout: float = 0.2,
         d_llm: int = 0,
         llm_offset: int = 0,
+        n_schools: int = 0,
+        d_school_emb: int = 16,
     ):
         super().__init__()
         self.backbone = backbone
         self.d_llm = d_llm
         self.llm_offset = llm_offset
+        self.n_schools = n_schools
         self.aggregator = ParticipantAggregator(
             d_in=d_shared, d_out=d_shared,
             method=aggregator_method, dropout=dropout,
@@ -95,6 +98,10 @@ class GroupedModel(nn.Module):
             )
         else:
             self.llm_proj = None
+        if n_schools > 0:
+            self.school_emb = nn.Embedding(n_schools, d_school_emb)
+        else:
+            self.school_emb = None
 
     def forward(
         self,
@@ -102,6 +109,7 @@ class GroupedModel(nn.Module):
         n_participants: int,
         session_valid: torch.Tensor,
         llm_features: torch.Tensor | None = None,
+        school_idx: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
 
         session_reprs = self.backbone(flat_batch)
@@ -120,6 +128,12 @@ class GroupedModel(nn.Module):
             session_reprs = F.pad(session_reprs, (0, 64))
 
         session_type_logits = self.session_type_head(session_reprs)
+
+        # Fuse school embedding at participant level (after session_type_head so
+        # school info doesn't leak into session-level predictions)
+        if self.school_emb is not None and school_idx is not None:
+            s_emb = self.school_emb(school_idx)
+            participant_repr = torch.cat([participant_repr, s_emb], dim=-1)
 
         return {
             "session_reprs": session_reprs,

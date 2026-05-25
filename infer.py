@@ -149,9 +149,10 @@ def main() -> None:
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
         llm_offset=llm_offset,
+        n_schools=10,
     ).to(device)
 
-    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
+    head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0) + 16  # +16 for school emb
     if args.task == "a1":
         task_head = A1Head(head_in_dim).to(device)
     elif args.task == "joint":

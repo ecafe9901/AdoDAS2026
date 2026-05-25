@@ -18,6 +18,11 @@ from .feature_io import SequenceData, load_egemaps_pooled, load_sequence
 
 log = logging.getLogger(__name__)
 
+SCHOOL_TO_IDX = {
+    "SCH_001": 0, "SCH_002": 1, "SCH_003": 2, "SCH_004": 3, "SCH_005": 4,
+    "SCH_006": 5, "SCH_007": 6, "SCH_008": 7, "SCH_009": 8, "SCH_010": 9,
+}
+
 
 class GroupedParticipantDataset(Dataset):
     def __init__(
@@ -55,6 +60,7 @@ class GroupedParticipantDataset(Dataset):
                 "sess_rows": sess_rows,
                 "y_a1": y_a1,
                 "y_a2": y_a2,
+                "school_idx": SCHOOL_TO_IDX.get(str(school), 0),
             })
 
         self._feature_dims: dict[str, int] | None = None
@@ -276,6 +282,7 @@ class GroupedParticipantDataset(Dataset):
             "anon_pid": info["anon_pid"],
             "anon_school": info["anon_school"],
             "anon_class": info["anon_class"],
+            "school_idx": info.get("school_idx", 0),
             "session_names": SESSIONS,
         }
         if llm_features is not None:
@@ -540,6 +547,7 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "anon_pids": [b["anon_pid"] for b in batch],
         "anon_schools": [b["anon_school"] for b in batch],
         "anon_classes": [b["anon_class"] for b in batch],
+        "school_idx": torch.tensor([b.get("school_idx", 0) for b in batch], dtype=torch.long),
         "flat_sessions": flat_sess_names,
         "flat_pids": flat_pids,
         "llm_features": llm_features,
