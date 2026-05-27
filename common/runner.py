@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", type=float, default=None)
     p.add_argument("--d_shared", type=int, default=None)
 
-    p.add_argument("--aggregator", type=str, default=None, choices=["mean", "mlp", "attention"])
+    p.add_argument("--aggregator", type=str, default=None, choices=["mean", "mlp", "attention", "transformer"])
     p.add_argument("--session_loss_weight", type=float, default=None)
     p.add_argument("--session_type_loss_weight", type=float, default=None)
     p.add_argument("--use_coral", type=int, default=None, help="1=use CORAL head for A2")
@@ -309,13 +309,36 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
     df = pd.read_csv(manifest_path)
     item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
     pw = np.ones((n_items, n_thresholds), dtype=np.float32)
-    max_clip = {0: 1.0, 1: 2.0, 2: 3.0}  # gentle push for rare thresholds only
     for j, col in enumerate(item_cols):
         vals = df[col].values.astype(int)
         for k in range(n_thresholds):
             p = max(np.mean(vals >= (k + 1)), 1e-6)
-            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, max_clip[k])
+            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 10.0)
     return torch.from_numpy(pw).unsqueeze(0)
+
+def compute_school_weights(manifest_path: Path) -> dict[str, float]:
+    """Compute per-school loss weights based on label entropy.
+
+    Schools with near-zero variance (e.g. SCH_003, 92% zeros) get lower weight.
+    Schools with high variance (e.g. SCH_005, 48% zeros) get higher weight.
+    """
+    import pandas as pd
+    df = pd.read_csv(manifest_path)
+    A2_COLS = [f"d{i:02d}" for i in range(1, 22)]
+    school_entropy = {}
+    for sch, group in df.groupby("anon_school"):
+        scores = group[A2_COLS].values.flatten().astype(int)
+        # Entropy of score distribution
+        probs = np.array([np.mean(scores == s) for s in range(4)])
+        probs = np.clip(probs, 1e-6, 1.0)
+        entropy = -np.sum(probs * np.log(probs))
+        school_entropy[sch] = entropy
+    # Normalize to mean=1.0
+    mean_ent = np.mean(list(school_entropy.values()))
+    weights = {sch: ent / mean_ent for sch, ent in school_entropy.items()}
+    log.info(f"School weights: " + " ".join(f"{s}={w:.2f}" for s, w in sorted(weights.items())))
+    return weights
+
 
 def train_one_epoch_grouped(
     grouped_model: GroupedModel,
@@ -339,6 +362,8 @@ def train_one_epoch_grouped(
     a1_pos_weight: torch.Tensor | None = None,
     a1_loss_weight: float = 0.3,
     gamma: float = 0.0,
+    school_weights: dict[str, float] | None = None,
+    adv_lambda: float = 0.1,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -425,6 +450,13 @@ def train_one_epoch_grouped(
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
             if a1_head is not None:
                 loss = loss + a1_loss_weight * a1_loss_val
+
+            # Adversarial school loss: penalize backbone for school-identifiable features
+            if out.get("school_logits") is not None:
+                school_idx_b = batch.get("school_idx")
+                if school_idx_b is not None:
+                    adv_loss = F.cross_entropy(out["school_logits"], school_idx_b.to(device))
+                    loss = loss + adv_lambda * adv_loss
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -991,7 +1023,8 @@ def main() -> None:
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
         llm_offset=llm_offset,
-        n_schools=10,
+        n_schools=0,
+        adv_lambda=0.0,
     ).to(device)
 
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
@@ -1049,6 +1082,7 @@ def main() -> None:
 
     session_loss_weight = cfg.get("session_loss_weight", 0.5)
     session_type_loss_weight = cfg.get("session_type_loss_weight", 0.15)
+    school_weights = compute_school_weights(manifest_dir / "train.csv")
     log.info(f"Session loss weight: {session_loss_weight}")
     log.info(f"Session type loss weight: {session_type_loss_weight}")
 
@@ -1108,7 +1142,10 @@ def main() -> None:
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
             a1_head=a1_head, a1_pos_weight=a1_pos_weight,
+            a1_loss_weight=cfg.get("a1_loss_weight", 0.3),
             gamma=cfg.get("gamma", 0.0),
+            school_weights=school_weights,
+            adv_lambda=cfg.get("adv_lambda", 0.1),
         )
 
         val_metrics = validate_grouped(

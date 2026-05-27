@@ -32,7 +32,7 @@ asp_beta: 0.5
 dropout: 0.2
 d_shared: 256
 
-aggregator: mlp
+aggregator: transformer
 batch_size: 24
 lr: 0.001
 weight_decay: 0.01

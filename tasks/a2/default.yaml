@@ -32,7 +32,7 @@ asp_beta: 0.5
 dropout: 0.2
 d_shared: 256
 
-aggregator: mlp
+aggregator: transformer
 use_coral: true
 batch_size: 24
 lr: 0.001
@@ -44,11 +44,12 @@ num_workers: 4
 amp: true
 preload: false
 grad_clip: 1.0
-use_pos_weight: false
+use_pos_weight: true
 patience: 10
+a1_loss_weight: 1.0
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
-gamma: 0.0
+gamma: 0.0  # focal disabled — pos_weight alone, test gamma later
 use_llm_features: false
 # llm_feature_dir: /mnt/data/datasets/AdoDAS/output/llm_calibrated
 submission_level: participant
@@ -57,3 +58,4 @@ label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.05
 early_stop_metric: primary
+# adv_lambda: 0.15  # disabled — adversarial debiasing regresses QWK
