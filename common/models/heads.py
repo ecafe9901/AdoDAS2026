@@ -7,12 +7,22 @@ import torch.nn.functional as F
 
 class A1Head(nn.Module):
 
-    def __init__(self, d_in: int, bias_init: list[float] | None = None) -> None:
+    def __init__(self, d_in: int, bias_init: list[float] | None = None,
+                 hidden: int = 0, dropout: float = 0.2) -> None:
         super().__init__()
-        self.fc = nn.Linear(d_in, 3)
+        if hidden > 0:
+            self.fc = nn.Sequential(
+                nn.Linear(d_in, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, 3),
+            )
+        else:
+            self.fc = nn.Linear(d_in, 3)
         if bias_init is not None:
             with torch.no_grad():
-                self.fc.bias.copy_(torch.tensor(bias_init, dtype=torch.float32))
+                last = self.fc[-1] if hidden > 0 else self.fc
+                last.bias.copy_(torch.tensor(bias_init, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)

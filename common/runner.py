@@ -102,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_pos_weight", type=int, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
     p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
+    p.add_argument("--stage2", type=int, default=None, help="1=Stage 2: freeze backbone+A2, retrain A1 head")
 
     return p.parse_args()
 
@@ -290,7 +291,7 @@ def _compute_pos_weight_a1(manifest_path: Path) -> list[float]:
         n_pos = df[col].sum()
         n_neg = len(df) - n_pos
         w = float(np.sqrt(n_neg / max(n_pos, 1)))
-        w = max(1.0, min(w, 2.0))
+        w = max(1.0, w)
         weights.append(w)
     return weights
 
@@ -364,6 +365,7 @@ def train_one_epoch_grouped(
     gamma: float = 0.0,
     school_weights: dict[str, float] | None = None,
     adv_lambda: float = 0.1,
+    stage2: bool = False,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -404,7 +406,25 @@ def train_one_epoch_grouped(
             has_valid_sessions = bool(valid_session_mask.any().item())
 
             p_logits = task_head(out["participant_repr"])
-            if task == "a1":
+            if stage2:
+                # Stage 2: A1-only loss, backbone+A2 frozen
+                a1_logits = a1_head(out["participant_repr"])
+                a1_targets = batch["participant_y_a1"].to(device)
+                main_loss = a1_loss(a1_logits, a1_targets,
+                                    pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
+                sess_loss = p_logits.new_zeros(())
+                type_loss = p_logits.new_zeros(())
+                a1_loss_val = p_logits.new_zeros(())
+                a1_sess_loss = p_logits.new_zeros(())
+                # A1 session loss (B01/B02/B03 only)
+                if has_valid_sessions:
+                    is_clinical = session_types[valid_session_mask] != 0
+                    a1_s_logits = a1_head(out["session_reprs"])[valid_session_mask]
+                    a1_s_targets = a1_targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
+                    if is_clinical.any():
+                        a1_sess_loss = a1_loss(a1_s_logits[is_clinical], a1_s_targets[is_clinical],
+                                               pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
+            elif task == "a1":
                 main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
             else:
                 main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing, gamma=gamma)
@@ -439,32 +459,47 @@ def train_one_epoch_grouped(
                 sess_loss = p_logits.new_zeros(())
                 type_loss = p_logits.new_zeros(())
 
-            # Joint A1 loss
+            # Joint A1 loss (participant-level)
             a1_loss_val = p_logits.new_zeros(())
+            a1_sess_loss = p_logits.new_zeros(())
             if a1_head is not None:
                 a1_logits = a1_head(out["participant_repr"])
                 a1_targets = batch["participant_y_a1"].to(device)
                 a1_loss_val = a1_loss(a1_logits, a1_targets,
                                       pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
 
-            loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
-            if a1_head is not None:
-                loss = loss + a1_loss_weight * a1_loss_val
+                # A1 session-level loss (B01/B02/B03 only, exclude A01)
+                if has_valid_sessions:
+                    a1_s_logits = a1_head(out["session_reprs"])[valid_session_mask]
+                    a1_s_targets = a1_targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
+                    if is_clinical.any():
+                        a1_sess_loss = a1_loss(a1_s_logits[is_clinical], a1_s_targets[is_clinical],
+                                               pos_weight=a1_pos_weight, label_smoothing=label_smoothing)
 
-            # Adversarial school loss: penalize backbone for school-identifiable features
-            if out.get("school_logits") is not None:
-                school_idx_b = batch.get("school_idx")
-                if school_idx_b is not None:
-                    adv_loss = F.cross_entropy(out["school_logits"], school_idx_b.to(device))
-                    loss = loss + adv_lambda * adv_loss
+            if stage2:
+                loss = main_loss + session_loss_weight * a1_sess_loss
+            else:
+                loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+                if a1_head is not None:
+                    loss = loss + a1_loss_weight * a1_loss_val + session_loss_weight * a1_sess_loss
+
+                # Adversarial school loss: penalize backbone for school-identifiable features
+                if out.get("school_logits") is not None:
+                    school_idx_b = batch.get("school_idx")
+                    if school_idx_b is not None:
+                        adv_loss = F.cross_entropy(out["school_logits"], school_idx_b.to(device))
+                        loss = loss + adv_lambda * adv_loss
 
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
-            if a1_head is not None:
-                _clip_params += list(a1_head.parameters())
+            if stage2:
+                _clip_params = list(a1_head.parameters())
+            else:
+                _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+                if a1_head is not None:
+                    _clip_params += list(a1_head.parameters())
             nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             grads_finite = all(
                 p.grad is None or torch.isfinite(p.grad).all()
@@ -477,9 +512,12 @@ def train_one_epoch_grouped(
             scaler.update()
         else:
             loss.backward()
-            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
-            if a1_head is not None:
-                _clip_params += list(a1_head.parameters())
+            if stage2:
+                _clip_params = list(a1_head.parameters())
+            else:
+                _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+                if a1_head is not None:
+                    _clip_params += list(a1_head.parameters())
             nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             grads_finite = all(
                 p.grad is None or torch.isfinite(p.grad).all()
@@ -1036,10 +1074,10 @@ def main() -> None:
     a1_pos_weight = None
     if joint:
         task_head = A2OrdinalHead(head_in_dim).to(device)
-        a1_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+        a1_head = A1Head(head_in_dim, bias_init=bias_init_a1, hidden=128, dropout=0.2).to(device)
         log.info("Joint A1+A2 training: A2 + A1")
     elif task == "a1":
-        task_head = A1Head(head_in_dim, bias_init=bias_init_a1).to(device)
+        task_head = A1Head(head_in_dim, bias_init=bias_init_a1, hidden=128, dropout=0.2).to(device)
     else:
         task_head = (CORALHead(head_in_dim) if bool(cfg.get("use_coral", False)) else A2OrdinalHead(head_in_dim)).to(device)
 
@@ -1068,14 +1106,41 @@ def main() -> None:
         else:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
 
-    params = list(grouped_model.parameters()) + list(task_head.parameters())
-    if joint:
-        params += list(a1_head.parameters())
+    stage2 = bool(cfg.get("stage2"))
+    if stage2:
+        use_amp = False
+        scaler = None
+        log.info("AMP disabled for Stage 2")
+        # Load Stage 1 checkpoint (backbone + A2 head only, no optimizer)
+        ckpt_path = Path(cfg["resume"])
+        log.info(f"Stage 2: loading backbone from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        grouped_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        task_head.load_state_dict(ckpt["head_state_dict"])
+        # Freeze backbone + A2 task head
+        for p in grouped_model.parameters():
+            p.requires_grad = False
+        for p in task_head.parameters():
+            p.requires_grad = False
+        # Re-init A1 head from scratch
+        a1_head = A1Head(head_in_dim, bias_init=bias_init_a1, hidden=128, dropout=0.2).to(device)
+        start_epoch = 1
+        best_metric = -1.0
+        log.info("Stage 2: backbone + A2 frozen, A1 head re-initialized")
+        log.info(f"  Trainable A1 params: {sum(p.numel() for p in a1_head.parameters()):,}")
+    lr = float(cfg.get("lr", 1e-3))
+    if stage2:
+        params = list(a1_head.parameters())
+        lr = float(cfg.get("stage2_lr", 1e-3))  # higher lr for stage2
+    else:
+        params = list(grouped_model.parameters()) + list(task_head.parameters())
+        if joint:
+            params += list(a1_head.parameters())
     optimizer = torch.optim.AdamW(
-        params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
+        params, lr=lr, weight_decay=cfg.get("weight_decay", 1e-2)
     )
-    epochs = cfg.get("epochs", 20)
-    warmup_epochs = cfg.get("warmup_epochs", 3)
+    epochs = cfg.get("stage2_epochs", cfg.get("epochs", 20)) if stage2 else cfg.get("epochs", 20)
+    warmup_epochs = 0 if stage2 else cfg.get("warmup_epochs", 3)
     scheduler = _build_scheduler(optimizer, warmup_epochs, epochs)
     log.info(f"Scheduler: warmup={warmup_epochs} -> cosine, total={epochs}")
     log.info(f"Grad clip: {grad_clip}")
@@ -1101,7 +1166,7 @@ def main() -> None:
 
     start_epoch = 1
     best_metric = -1.0
-    if cfg.get("resume"):
+    if cfg.get("resume") and not stage2:
         ckpt_path = Path(cfg["resume"])
         log.info(f"Resuming from {ckpt_path}")
         state = load_checkpoint(ckpt_path, grouped_model, optimizer)
@@ -1146,6 +1211,7 @@ def main() -> None:
             gamma=cfg.get("gamma", 0.0),
             school_weights=school_weights,
             adv_lambda=cfg.get("adv_lambda", 0.1),
+            stage2=stage2,
         )
 
         val_metrics = validate_grouped(

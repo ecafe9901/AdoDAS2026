@@ -46,7 +46,7 @@ preload: false
 grad_clip: 1.0
 use_pos_weight: true
 patience: 10
-a1_loss_weight: 1.0
+a1_loss_weight: 0.3
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 gamma: 0.0  # focal disabled — pos_weight alone, test gamma later
