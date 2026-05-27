@@ -164,3 +164,82 @@ If V2 actually used A2OrdinalHead (fixed thresholds, non-learnable), the analysi
 |-----|-----------|
 | Add dimension assertion at load time | Catch V1/V2/V3 format mismatches |
 | Ablate LLM features vs no LLM | Measure actual contribution once ordinal collapse is fixed |
+
+---
+
+## 5. Remaining Known Issues (As of 2026-05-28, commit `8bf1edb`)
+
+Four issues identified from the current codebase. Prioritized by actual impact.
+
+### P3 (No Impact): `"a1_preds" in dir()` — Dead Code
+
+**Location**: [`common/runner.py:1501`](../common/runner.py#L1501)
+
+```python
+if joint and "a1_preds" in dir() and len(a1_preds) > 0:
+```
+
+`dir()` returns a list of names in the current scope — `"a1_preds" in dir()` always returns `True` in CPython for any local variable assigned anywhere in the function, because the compiler statically allocates all local variable slots. This check never prevents an `UnboundLocalError`.
+
+However, this is dead rather than buggy: `joint=True` and `a1_head is not None` (lines 1427, 1076) always co-occur, so `a1_preds` is always defined when this branch is reached. The `dir()` guard is purely redundant.
+
+**Fix**: Remove the `"a1_preds" in dir()` condition entirely.
+
+---
+
+### P0 (Core Bottleneck): CORALHead Shared `score_fc` Limits Per-Threshold Adaptation
+
+**Location**: [`common/models/grouped_model.py:224-236`](../common/models/grouped_model.py#L224-L236)
+
+All 3 ordinal thresholds share a single `score_fc` linear layer:
+```python
+logits = scores.unsqueeze(-1) - thresholds.unsqueeze(0)
+```
+
+**Evidence from Baseline+ training log (QWK=0.253)**:
+- Score=0/1/2 distributions converge to match GT by epoch 10
+- Score=3 first appears at epoch 31, matches GT proportion (2.4%) by epoch 34
+- But QWK **drops** from 0.234 → 0.211 when score=3 emerges
+
+**Root cause**: Raising `scores` to cross threshold 3 also pushes logits for thresholds 1 and 2 upward, disturbing already-learned boundaries. The model eventually produces the right *number* of score=3 predictions but cannot *discriminate which samples deserve them*.
+
+**Fix**: Add a per-threshold bias to CORALHead:
+```python
+self.threshold_bias = nn.Parameter(torch.zeros(1, n_items, n_thresholds))
+# Forward:
+logits = scores.unsqueeze(-1) - thresholds.unsqueeze(0) + self.threshold_bias
+```
+Initialize bias at 0 and use a lower learning rate (e.g. via separate param group with `lr_mult=0.1`) to avoid disturbing thresholds 1-2.
+
+---
+
+### P1 (Secondary): Cosine LR `eta_min=1e-6` Too Aggressive
+
+**Location**: [`common/runner.py:206`](../common/runner.py#L206)
+
+```python
+cosine = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-6)
+```
+
+By epoch 30 (out of 40), LR decays to ~1.1e-4. By epoch 34 (when score=3 first appears at correct proportion), LR is 6.4e-5 — too low for meaningful boundary adjustment.
+
+**Not the primary bottleneck**: score=3's precision problem persists even at higher LR (epochs 31-33). The model needs architectural change (per-threshold bias) more than LR schedule change.
+
+**Recommended fix**: Either raise `eta_min` to 5e-5, or switch to `ReduceLROnPlateau(factor=0.5, patience=5)` with a floor of 1e-5.
+
+---
+
+### P2 (Minor): Uniform label_smoothing Across All Classes
+
+**Location**: [`common/models/heads.py:92-93`](../common/models/heads.py#L92)
+
+```python
+if label_smoothing > 0.0:
+    targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
+```
+
+**Analysis**: With `label_smoothing=0.05`, score=3 targets (2.5% of samples) are diluted from 1.0 → 0.975, a 2.5% gradient reduction. The BCE gradient `sigmoid(logit) - target` shifts by only 0.025. Compared to pos_weight=6.24 amplifying threshold 3 gradients 6×, this smoothing effect is negligible.
+
+**Evidence**: Score=2 (4.7% of samples, same pos_weight=3.09) converges correctly from epoch 7 onward. Label smoothing is not preventing tail learning.
+
+**Recommended fix**: Lower to 0.02 for safety. Per-threshold smoothing is unnecessary complexity for negligible gain.
