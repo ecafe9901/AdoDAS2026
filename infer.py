@@ -149,7 +149,6 @@ def main() -> None:
         dropout=cfg.get("dropout", 0.2),
         d_llm=d_llm,
         llm_offset=llm_offset,
-        n_schools=10,
     ).to(device)
 
     head_in_dim = bb_cfg.d_shared + (64 if d_llm > 0 else 0)
@@ -167,8 +166,12 @@ def main() -> None:
     task_head.load_state_dict(state["head_state_dict"])
     a1_head = None
     if args.task == "joint" and "a1_head_state_dict" in state:
-        a1_head = A1Head(head_in_dim).to(device)
-        a1_head.load_state_dict(state["a1_head_state_dict"])
+        a1_state = state["a1_head_state_dict"]
+        # Detect deep vs shallow A1 head from checkpoint keys
+        is_deep = any("fc.0." in k for k in a1_state.keys())
+        a1_head = A1Head(head_in_dim, hidden=128 if is_deep else 0, dropout=0.2).to(device)
+        a1_head.load_state_dict(a1_state)
+        print("Loaded A1 head from checkpoint")
     grouped_model.eval()
     task_head.eval()
 
