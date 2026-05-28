@@ -1498,7 +1498,7 @@ def main() -> None:
             log.info(f"Wrote {len(sub)} rows to {out_path}")
 
             # A1 submission for joint mode
-            if joint and "a1_preds" in locals() and len(a1_preds) > 0:
+            if joint and len(a1_preds) > 0:
                 a1_filtered = [a1_preds[i] for i in range(len(a1_preds))
                                if file_ids[i] in set(file_ids)]
                 if len(a1_filtered) == len(file_ids):
