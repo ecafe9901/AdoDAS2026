@@ -171,19 +171,13 @@ If V2 actually used A2OrdinalHead (fixed thresholds, non-learnable), the analysi
 
 Four issues identified from the current codebase. Prioritized by actual impact.
 
-### P3 (No Impact): `"a1_preds" in dir()` — Dead Code
+### ~~P3 (No Impact): `"a1_preds" in dir()` — Dead Code~~ ✅ FIXED in `19bdcdc`
 
 **Location**: [`common/runner.py:1501`](../common/runner.py#L1501)
 
-```python
-if joint and "a1_preds" in dir() and len(a1_preds) > 0:
-```
+The guard `"a1_preds" in dir()` was redundant — `joint=True` and `a1_head is not None` always co-occur, so `a1_preds` is always defined.
 
-`dir()` returns a list of names in the current scope — `"a1_preds" in dir()` always returns `True` in CPython for any local variable assigned anywhere in the function, because the compiler statically allocates all local variable slots. This check never prevents an `UnboundLocalError`.
-
-However, this is dead rather than buggy: `joint=True` and `a1_head is not None` (lines 1427, 1076) always co-occur, so `a1_preds` is always defined when this branch is reached. The `dir()` guard is purely redundant.
-
-**Fix**: Remove the `"a1_preds" in dir()` condition entirely.
+**Fix**: Removed the entire guard condition. Now `if joint and len(a1_preds) > 0:`.
 
 ---
 
